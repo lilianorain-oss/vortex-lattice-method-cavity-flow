@@ -10,7 +10,7 @@ class VLMSolver:
     #--------------------#
     #   Initialization   #
     #--------------------#
-    def __init__(self, surfaces, u_inf, boundary):
+    def __init__(self, surfaces, u_inf, boundary, ratio, a_ratio):
 
         # Flow properties
         self.U        = u_inf      # inflow velocity [m/s]
@@ -27,7 +27,12 @@ class VLMSolver:
         # Linear system
         self.A = None       # influence coefficient matrix
         self.b = None       # right hand side
-    
+
+        # Numerical stability parameters
+        self.rc      = None       # minimum panel width - used as a reference for the cutoff distance
+        self.ratio   = ratio      # ratio of the cutoff distance to the minimum panel width
+        self.a_ratio = a_ratio    # ratio of the cutoff distance to the minimum panel width for the A matrix computation
+
         self.time=0
 
         self._get_parameters()
@@ -43,7 +48,11 @@ class VLMSolver:
         ctrl  = []
         norm  = []
         N_tot = 0
+        r_min = 100
         for surface in self.surfaces :
+            r_surf = np.linalg.norm(surface.wing["real"][surface.N] - surface.wing["real"][surface.N-1])   
+            if r_surf < r_min :
+                r_min = r_surf
             N_tot += surface.N * surface.M
             for panel in surface.wing_panels["real"] :
                 ctrl.append(panel.ctr)     # we compute the normals and control points vector only once
@@ -51,61 +60,11 @@ class VLMSolver:
         self.N_tot    = N_tot
         self.controls = np.array(ctrl)
         self.normals  = np.array(norm)
+        self.rc       = r_min
 
     @staticmethod
     @nb.njit(parallel=True, fastmath=True)
-    def _induced_velocity(p, c1, c2, gamma):
-        N = p.shape[0]
-        M = c1.shape[0]
-        v_total = np.zeros((N, 3), dtype=np.float64)
-        eps = 1e-4
-
-        # Parallélisation sur les points d'évaluation
-        for i in nb.prange(N):
-            px, py, pz = p[i, 0], p[i, 1], p[i, 2]
-            
-            for j in range(M):
-                # Vecteurs r1 et r2
-                rx1 = px - c1[j, 0]
-                ry1 = py - c1[j, 1]
-                rz1 = pz - c1[j, 2]
-                
-                rx2 = px - c2[j, 0]
-                ry2 = py - c2[j, 1]
-                rz2 = pz - c2[j, 2]
-                
-                # Vecteur r0 (c2 - c1)
-                r0x = c2[j, 0] - c1[j, 0]
-                r0y = c2[j, 1] - c1[j, 1]
-                r0z = c2[j, 2] - c1[j, 2]
-                
-                # Produit vectoriel r1 x r2
-                cx = ry1 * rz2 - rz1 * ry2
-                cy = rz1 * rx2 - rx1 * rz2
-                cz = rx1 * ry2 - ry1 * rx2
-                
-                cross_norm2 = cx*cx + cy*cy + cz*cz
-                r1_norm = np.sqrt(rx1*rx1 + ry1*ry1 + rz1*rz1)
-                r2_norm = np.sqrt(rx2*rx2 + ry2*ry2 + rz2*rz2)
-                
-                # Vérification de la singularité (mask)
-                if r1_norm > eps and r2_norm > eps and cross_norm2 > eps**4:
-                    # Calcul du terme scalaire
-                    dot_term = r0x * (rx1/r1_norm - rx2/r2_norm) + \
-                            r0y * (ry1/r1_norm - ry2/r2_norm) + \
-                            r0z * (rz1/r1_norm - rz2/r2_norm)
-                    
-                    # Assemblage final
-                    coeff = gamma[j] / (12.566370614359172) # 4 * pi
-                    factor = coeff * dot_term / cross_norm2
-                    
-                    v_total[i, 0] += cx * factor
-                    v_total[i, 1] += cy * factor
-                    v_total[i, 2] += cz * factor
-                    
-        return v_total
-    
-    def _induced_velocityp (self,p,c1,c2,gamma):
+    def _induced_velocity(p,c1,c2,gamma, rc):
         """
         Return the velocity induced by the vortex segments [c1, c2], of strentgh gamma,
         at the points p
@@ -115,28 +74,70 @@ class VLMSolver:
         c1    -> starting points of the segments, shape (M,3)
         c2    -> ending points of the segments, shape (M,3)
         gamma -> circulation of each segment, shape (M,)
+        rc   -> cutoff distance for the induced velocity, shape (1,)
 
         Output :
         v     -> velocity induced at each point by each segment, shape (N,3)
         """
-        r1 = p[:, None, :] - c1[None, :, :]    # (N,M,3)
-        r2 = p[:, None, :] - c2[None, :, :]    # (N,M,3)
-        r0 = c2[None, :, :] - c1[None, :, :]   # (1,M,3)
-        r1_norm = np.linalg.norm(r1, axis=2)   # (N,M)
-        r2_norm = np.linalg.norm(r2, axis=2)
-        cross = np.cross(r1, r2)                # (N,M,3)
-        cross_norm2 = np.sum(cross**2, axis=2)  # (N,M)
-        # The safe are needed to avoid division by zero, the value of 1.0 is arbitrary since we will set the velocity to zero in these case
-        eps = 1e-5
-        r2_norm_safe = np.where(r2_norm < eps, 1.0, r2_norm)    
-        r1_norm_safe = np.where(r1_norm < eps, 1.0, r1_norm)    
-        cross_norm2_safe = np.where(cross_norm2 < eps, 1.0, cross_norm2)
-        mask = ((r1_norm > eps) &(r2_norm > eps) &(cross_norm2 > eps))                               # points on or aligned with the segment
-        term = np.sum(r0 * (r1 / r1_norm_safe[:, :, None] - r2 / r2_norm_safe[:, :, None]), axis=2)  # (N,M)
-        coeff = gamma[None, :] / (4 * np.pi)
-        v = coeff[:, :, None] * (cross / cross_norm2_safe[:, :, None]) * term[:, :, None]
-        v[~mask] = 0                    # if one point is on or aligned with the segment, its induced velocity is 0
-        return np.sum(v, axis=1)  # (N,3)
+        N = p.shape[0]
+        M = c1.shape[0]
+        v_total = np.zeros((N, 3), dtype=np.float64)
+
+        eps = rc*1e-10
+        inv4pi = 1.0 / (4.0 * np.pi)
+        d_cut2 = (rc)**2
+
+        # Parallel loop over points
+        for i in nb.prange(N):
+            px, py, pz = p[i, 0], p[i, 1], p[i, 2]
+            vx = 0.0
+            vy = 0.0
+            vz = 0.0
+
+            for j in range(M):
+
+                rx1 = px - c1[j, 0]
+                ry1 = py - c1[j, 1]
+                rz1 = pz - c1[j, 2]
+
+                rx2 = px - c2[j, 0]
+                ry2 = py - c2[j, 1]
+                rz2 = pz - c2[j, 2]
+
+                r0x = c2[j, 0] - c1[j, 0]
+                r0y = c2[j, 1] - c1[j, 1]
+                r0z = c2[j, 2] - c1[j, 2]
+                r0_norm2 = r0x * r0x + r0y * r0y + r0z * r0z
+
+                cx = ry1 * rz2 - rz1 * ry2
+                cy = rz1 * rx2 - rx1 * rz2
+                cz = rx1 * ry2 - ry1 * rx2
+
+                cross_norm2 = cx * cx + cy * cy + cz * cz
+
+                r1_norm = np.sqrt(rx1 * rx1 + ry1 * ry1 + rz1 * rz1)
+                r2_norm = np.sqrt(rx2 * rx2 + ry2 * ry2 + rz2 * rz2)
+
+                if r0_norm2 > 0.0 and r1_norm > eps and r2_norm > eps:
+                    d2 = cross_norm2 / r0_norm2   # perpendicular distance squared from the point to the segment
+                    if d2 >= d_cut2:
+
+                        dot_term = (
+                            r0x * (rx1 / r1_norm - rx2 / r2_norm)
+                            + r0y * (ry1 / r1_norm - ry2 / r2_norm)
+                            + r0z * (rz1 / r1_norm - rz2 / r2_norm)
+                        )
+
+                        factor = gamma[j] * inv4pi * dot_term / cross_norm2
+
+                        vx += cx * factor
+                        vy += cy * factor
+                        vz += cz * factor
+                    # else : contribution ignored
+            v_total[i, 0] = vx
+            v_total[i, 1] = vy
+            v_total[i, 2] = vz
+        return v_total
     
 
     def _vectorize (self, grid, gamma, n) :
@@ -195,7 +196,6 @@ class VLMSolver:
                     mid_grid  = surface.wake[k]["middle"]
                     mid_gamma = surface.gamma_wake["middle"]
                 c1, c2, gamma_v      = self._vectorize(mid_grid, mid_gamma, surface.N)
-
                 if ( surface.tip_shed == "left" ) or ( surface.tip_shed == "both" ) :
                     c1_l, c2_l, gamma_vl = self._vectorize(surface.wake[k]["left"], surface.gamma_wake["left"], round(len(surface.wake[k]["left"])/(surface.M+1)-1))
                 else :
@@ -209,9 +209,12 @@ class VLMSolver:
                 if k=="real":           # used to put a - before the mirrored gamma if we want a pure symmetric boundary condition (wall), without a minus its a negative image
                     gamma_tot = np.concatenate([gamma_tot, gamma_v, gamma_vl, gamma_vr]) 
                 else :
-                    gamma_tot = np.concatenate([gamma_tot, gamma_v, gamma_vl, gamma_vr]) 
+                    if self.boundary=="antisymmetric" :
+                        gamma_tot = np.concatenate([gamma_tot, gamma_v, gamma_vl, gamma_vr]) 
+                    else :
+                        gamma_tot = np.concatenate([gamma_tot, -gamma_v, -gamma_vl, -gamma_vr]) 
         return c1_tot, c2_tot, gamma_tot
-            
+
     def _build_A (self):
         """
         Construct the influence coefficients matrix A by computing the velocity induced at each control point by each vortex ring,
@@ -227,12 +230,15 @@ class VLMSolver:
                 v = surface.wing_panels["real"][i].vrt
                 c1 = np.array([v[0], v[1],v[2], v[3]]).reshape(-1,3)                
                 c2 = np.array([v[1], v[2],v[3], v[0]]).reshape(-1,3)
-                v_ring = self._induced_velocity(ctrl, c1, c2, np.array([1,1,1,1]))  # velocity induced at each control point by the vortex ring of panel j (global) / i (local)
-                if self.boundary :
+                v_ring = self._induced_velocity(ctrl, c1, c2, np.array([1,1,1,1]), self.rc*self.a_ratio)  # velocity induced at each control point by the vortex ring of panel j (global) / i (local)
+                if self.boundary=="symmetric" or self.boundary=="antisymmetric" :
                     v = surface.wing_panels["mirror"][i].vrt
                     c1 = np.array([v[0], v[1],v[2], v[3]]).reshape(-1,3)                
                     c2 = np.array([v[1], v[2],v[3], v[0]]).reshape(-1,3)
-                    v_ring = v_ring + self._induced_velocity(ctrl, c1, c2, -np.array([1,1,1,1]))    # velocity induced at each control point by the vortex mirror ring of panel j (global) / i (local)
+                    if self.boundary=="symmetric":
+                        v_ring = v_ring + self._induced_velocity(ctrl, c1, c2, -np.array([1,1,1,1]), self.rc*self.a_ratio)    # velocity induced at each control point by the vortex mirror ring of panel j (global) / i (local)
+                    else :
+                        v_ring = v_ring + self._induced_velocity(ctrl, c1, c2, np.array([1,1,1,1]), self.rc*self.a_ratio)
                 A[:,j] = np.sum(v_ring * norm, axis=1)                                           # projection of the induced velocity on the normal direction of each panel
                 j += 1
         self.A = A
@@ -253,7 +259,7 @@ class VLMSolver:
             v = np.tile(np.array([0,0,0]), (n,1))
         else :
             c1, c2, gamma_v = self._full_vectorize(False)
-            v = self._induced_velocity(ctrl, c1, c2, gamma_v)                 # velocity induced at each control point by the wake vortex rings
+            v = self._induced_velocity(ctrl, c1, c2, gamma_v, self.rc*self.ratio)                 # velocity induced at each control point by the wake vortex rings
         b = -np.sum((v + u_inf) * normal, axis=1)
         self.b = b
 
@@ -266,6 +272,7 @@ class VLMSolver:
         """
         u        = self.U
         surfaces = self.surfaces
+        u_norm   = np.linalg.norm(u)
         for surface in surfaces:
             m, n        = surface.M, surface.N
             wing_panels = surface.wing_panels
@@ -289,11 +296,12 @@ class VLMSolver:
             chords   = np.array(chords)
             points_t = np.array(points_t)
             c1, c2, gamma_v = self._full_vectorize(True)
-            F_trailing = np.cross(u_inf_t + self._induced_velocity(points_t, c1, c2, gamma_v), circ_t[:,None]*chords)          # loads of the trailing segments by Kutta-Joukowski
-            F_bound    = np.cross(u_inf + self._induced_velocity(points, c1, c2, gamma_v), circ[:,None]*width)                 # loads of the bound segments by Kutta-Joukowski                                  
+            F_trailing = np.cross(u_inf_t + self._induced_velocity(points_t, c1, c2, gamma_v, self.rc*self.ratio), circ_t[:,None]*chords)          # loads of the trailing segments by Kutta-Joukowski
+            F_bound    = np.cross(u_inf + self._induced_velocity(points, c1, c2, gamma_v, self.rc*self.ratio), circ[:,None]*width)                 # loads of the bound segments by Kutta-Joukowski                                  
             F_tot      = np.sum( np.concatenate([F_bound, F_trailing]), axis = 0 ) 
             S = np.sum(np.array([p.area for p in surface.wing_panels["real"]]).reshape(m,n), axis=0)
-            surface.Cl_2d = 2*np.sum(F_bound[:,1].reshape(m, n), axis=0)/S
+            p = surface.plan
+            surface.Cl_2d = 2*np.sum(F_bound[:,p+1].reshape(m, n), axis=0)/(S*u_norm*u_norm) #(-2*p+1) *  # 2D lift coefficient at each spanwise station, reverse the sign if plan is 1 because the z axis point downward
             surface.loads = F_tot
         
     def _secondary_computation (self):
@@ -352,7 +360,10 @@ class VLMSolver:
         # Initialization
         u_inf    = self.U
         surfaces = self.surfaces
-        boundary = self.boundary
+        free_sur = self.boundary
+        boundary = False
+        if free_sur=="symmetric" or free_sur=="antisymmetric" :
+            boundary = True
         self._build_A()
         A = self.A
         inv_A = np.linalg.inv(A)
@@ -412,14 +423,14 @@ class VLMSolver:
                 wake   = surface.wake["real"]["middle"]
                 l_wake = surface.wake["real"]["left"]
                 r_wake = surface.wake["real"]["right"]
-                wake   = wake + np.concatenate([np.zeros((n+1,3)), dta[s]*self._induced_velocity(wake[n+1:], c1, c2, gamma_v)])    # each corner point except at the edges are convect by the induced velocity
+                wake   = wake + np.concatenate([np.zeros((n+1,3)), dta[s]*self._induced_velocity(wake[n+1:], c1, c2, gamma_v, self.rc*self.ratio)])    # each corner point except at the edges are convect by the induced velocity
                 l_wake = l_wake + np.hstack([
-                    dta[s]*self._induced_velocity(l_wake.reshape(m+1, s+2, 3)[:,:s+1].reshape(-1, 3), c1, c2, gamma_v).reshape(m+1, s+1, 3),
+                    dta[s]*self._induced_velocity(l_wake.reshape(m+1, s+2, 3)[:,:s+1].reshape(-1, 3), c1, c2, gamma_v, self.rc*self.ratio).reshape(m+1, s+1, 3),
                     np.zeros((m+1,1,3))
                     ]).reshape(-1, 3)                               # reshape in 2D grid to not take into account the tip edge
                 r_wake = r_wake + np.hstack([
                     np.zeros((m+1,1,3)), 
-                    dta[s]*self._induced_velocity(r_wake.reshape(m+1, s+2, 3)[:,1:].reshape(-1, 3), c1, c2, gamma_v).reshape(m+1, s+1, 3),
+                    dta[s]*self._induced_velocity(r_wake.reshape(m+1, s+2, 3)[:,1:].reshape(-1, 3), c1, c2, gamma_v, self.rc*self.ratio).reshape(m+1, s+1, 3),
                     ]).reshape(-1, 3)
                 surface._update_wake([wake, l_wake, r_wake])
                 # at the last step we build the wake panels, usefull for plotting
