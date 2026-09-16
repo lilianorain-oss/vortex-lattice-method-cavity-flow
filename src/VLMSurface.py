@@ -13,7 +13,7 @@ class VLMSurface:
     #--------------------#
     #   Initialization   #
     #--------------------#
-    def __init__(self, origin, plan, boundary, shedding, b, c, alpha, beta, lamb, delta, phi, sym, space, n, m):
+    def __init__(self, origin, plan, boundary, shedding, b, c, alpha, beta, lamb, delta, phi, sym, space, n, m, vent):
         
         # Wing geometry
         self.origin    = origin     # starting point of the wing - will end at the middle if it's a symmetric wing
@@ -36,26 +36,90 @@ class VLMSurface:
         self.drift     = beta       # geometric angle of drift  [rad]   -> axe = -z
         self.tip_shed  = shedding   # enable the tip shedding - both -> both tips ; right -> only right tip ; left -> only left tip ; none -> both disable
                                     # left and right are defined for an horizontal wing, for a vertical one left <-> top and right <-> bottom
+        self.ventilate = vent       # True enables the ventilation on the surface
+        
         # Mesh
         self.wing        = {"real":None}    # wing - and mirrored wing - corner points
         self.wing_panels = {"real":None}    # wing - and mirrored wing - panels
         self.edges       = {}               # trailing edge, left tip and right tip
+        self.orientation = None             # orientation of the normals / 1 for upward -1 for downward
         self.wake        = {"real":{"middle":np.array([])},"mirror":{}}    # wake - and mirrored wake - corner points, divided in middle, left and right
         self.wake_panels = {"real":[], "mirror":[]}                        # wake - and mirrored wake - panels, divided in middle, left and right
+        self.normals     = None             # normal vector of each panel
 
         # vortex strengths
         self.gamma       = np.array([])
-        self.ventilation = {}               # ventilation output : a0, alpha_eff, sigma_c, Lc/c 
         self.gamma_wake  = {"middle":np.array([]), "right":np.array([]), "left":np.array([])}
 
         # secondary computations
         self.loads       = None             # 3D loads 
-        self.Cl_2d       = None             # lift coef at each section
+        self.Cl_2d       = None             # normal lift coef at each section
+        self.area        = None             # total area of the surface
+
+        # ventilation 
+        self.ventilation = {}               # ventilation output : a0, alpha_eff, sigma_c, Lc/c 
+        self.max_depth   = None
+
+        self._build_wing()
 
     #-------------#
     #   Methods   #
     #-------------#
 
+    def _reset(self):
+        """
+        Reset the surface to its state just after _build_wing, before any use in VLMSolver
+        """
+        self.wake        = {"real":{"middle":np.array([])},"mirror":{}}    # wake - and mirrored wake - corner points, divided in middle, left and right
+        self.wake_panels = {"real":[], "mirror":[]}                        # wake - and mirrored wake - panels, divided in middle, left and right
+        self.normals     = None             # normal vector of each panel
+
+        # vortex strengths
+        self.gamma = np.empty(0)
+        self.gamma_wake = {"middle": np.empty(0),  "right":  np.empty(0),  "left":   np.empty(0)}
+
+        # secondary computations
+        self.loads       = None             # 3D loads 
+        self.Cl_2d       = None             # normal lift coef at each section
+        self.Cl_old      = None 
+        self.ventilation = {}
+
+        self.wake = {
+            "real": {
+                "middle": np.empty((0, 3)),
+                "left":   np.empty((0, 3)),
+                "right":  np.empty((0, 3))
+            },
+            "mirror": {}
+        }
+        self.wake_panels = {"real": [], "mirror": []}
+        
+
+        
+
+
+    def _set_normals(self, thetas):
+        """
+        Gets the normal vectors taking into account the correction of the ventilation algorithm.
+
+        Input:
+            thetas -> rotation angles - shape (N+1,) / if thetas isn't an array no correction (thetas = 0)
+        """
+        m, n = self.M, self.N
+        normals = np.zeros((m*n, 3))
+        for k,panel in enumerate(self.wing_panels["real"]):
+            normals[k] = panel.normal
+        normals_rot = copy.copy(normals)    
+        if isinstance(thetas, np.ndarray):
+            theta  = np.tile(thetas, m)     # broadcast thetas to match the number of panels
+            x = np.array([1, 0, 0])
+            K = np.cross(x, normals)
+            norm_K = np.linalg.norm(K, axis=1, keepdims=True)
+            K = np.where(norm_K > 1e-8, K / norm_K, np.array([[0.0, 1.0, 0.0]]))        # if the normal is aligned with x we choose to rotate around y, but it should not happen
+            theta_col = np.array(theta).reshape(-1, 1)
+            normals_rot = normals * np.cos(theta_col) + np.cross(K, normals) * np.sin(theta_col)
+        self.normals = normals_rot
+        
     def _unit_rot(self, v, theta, ax):
         """
         Elemental clockwise rotation of the reference system axes.
@@ -215,12 +279,19 @@ class VLMSurface:
         self.edges["left"]   = r_earth.reshape(m+1, n+1, 3)[:,0,:].reshape(m+1,3)  # get the left tip
         self.edges["right"]  = r_earth.reshape(m+1, n+1, 3)[:,n,:].reshape(m+1,3)  # get the left tip
 
+        # max depth
+        ctrl     = np.array([p.ctr for p in self.wing_panels["real"]])
+        z        = np.sum(ctrl.reshape((m,n,3)), axis=0)[:,2]/m  
+        self.max_depth = np.max(z)
+
         # boundary condition
         if self.boundary=="symmetric" or self.boundary=="antisymmetric" :
             p_mir = self._symmetry(p_earth, False, np.array([0,0,1]),np.array([0,0,0]),n)
             r_mir = self._symmetry(r_earth, False, np.array([0,0,1]),np.array([0,0,0]),n)
             self.wing_panels["mirror"] = self._paneling(p_mir, r_mir, 0, n, b)
             self.wing["mirror"]        = r_mir
+
+        
 
 
     def _apply_twist(self):
@@ -291,19 +362,21 @@ class VLMSurface:
             self.wake["mirror"]["left"]   = self._symmetry(wake[1], False, np.array([0,0,1]), np.array([0,0,0]), 0)
             self.wake["mirror"]["right"]  = self._symmetry(wake[2], False, np.array([0,0,1]), np.array([0,0,0]), 0)
         
-    def _ventilation_coef(self, aoa, froude):
+    def _ventilation_coef(self, aoa, u):
         """
         Compute the correction coefficent which model the ventilation
 
         Input :
-            aoa    -> effective angle of attack
-            froude -> froude number of the flow
+            aoa -> effective angle of attack
+            u   -> velocity of the flow
         """
         m, n     = self.M, self.N
+        h        = self.max_depth
         aoa_safe = np.maximum(aoa, 0.001)
         ctrl     = np.array([p.ctr for p in self.wing_panels["real"]])
         z        = np.sum(ctrl.reshape((m,n,3)), axis=0)[:,2]/m      # mean depth of each spanwise station
-        sigma_c = 2*z/((froude**2)*z[-1])                          # cavitation number at each spanwise station
+        froude   = u/np.sqrt(9.81*h)
+        sigma_c  = 2*z/((froude**2)*h)                          # cavitation number at each spanwise station
         psi      = sigma_c/(2*aoa)
         Lc       = (2.67*psi + 96.62)/(psi**3 - 7.1*psi**2 + 49.42*psi + 0.961)      # cavity lentgh divided by the chord lentgh
         a0       = (np.pi/2*Lc**3 - 2*Lc**2 +4.5*Lc + 1)/(Lc**3 - Lc**2 + 0.75*Lc + 1/(2*np.pi))
@@ -311,4 +384,5 @@ class VLMSurface:
         self.ventilation["alpha_eff"] = aoa
         self.ventilation["sigma_c"]   = sigma_c
         self.ventilation["Lc/c"]      = Lc
+        self.ventilation["froude"]    = froude
 

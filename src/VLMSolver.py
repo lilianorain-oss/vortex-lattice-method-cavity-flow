@@ -2,72 +2,6 @@ import numpy as np
 import copy as copy
 import numba as nb
 
-@nb.njit(parallel=True, fastmath=True)
-def _induced_velocity_numba(p, c1, c2, gamma, b):
-    N = p.shape[0]
-    M = c1.shape[0]
-    v_total = np.zeros((N, 3), dtype=np.float64)
-
-    eps = b*1e-10
-    inv4pi = 1.0 / (4.0 * np.pi)
-    d_cut2 = (b*0.4)**2
-
-    # Parallélisation sur les points d'évaluation
-    for i in nb.prange(N):
-        px, py, pz = p[i, 0], p[i, 1], p[i, 2]
-        vx = 0.0
-        vy = 0.0
-        vz = 0.0
-
-        for j in range(M):
-
-            rx1 = px - c1[j, 0]
-            ry1 = py - c1[j, 1]
-            rz1 = pz - c1[j, 2]
-
-            rx2 = px - c2[j, 0]
-            ry2 = py - c2[j, 1]
-            rz2 = pz - c2[j, 2]
-
-            r0x = c2[j, 0] - c1[j, 0]
-            r0y = c2[j, 1] - c1[j, 1]
-            r0z = c2[j, 2] - c1[j, 2]
-            r0_norm2 = r0x * r0x + r0y * r0y + r0z * r0z
-
-            cx = ry1 * rz2 - rz1 * ry2
-            cy = rz1 * rx2 - rx1 * rz2
-            cz = rx1 * ry2 - ry1 * rx2
-
-            cross_norm2 = cx * cx + cy * cy + cz * cz
-
-            r1_norm = np.sqrt(rx1 * rx1 + ry1 * ry1 + rz1 * rz1)
-            r2_norm = np.sqrt(rx2 * rx2 + ry2 * ry2 + rz2 * rz2)
-
-            if r0_norm2 > 0.0 and r1_norm > eps and r2_norm > eps:
-
-                d2 = cross_norm2 / r0_norm2   # distance perpendiculaire^2 a la droite portant le segment
-
-                if d2 >= d_cut2:
-
-                    dot_term = (
-                        r0x * (rx1 / r1_norm - rx2 / r2_norm)
-                        + r0y * (ry1 / r1_norm - ry2 / r2_norm)
-                        + r0z * (rz1 / r1_norm - rz2 / r2_norm)
-                    )
-
-                    factor = gamma[j] * inv4pi * dot_term / cross_norm2
-
-                    vx += cx * factor
-                    vy += cy * factor
-                    vz += cz * factor
-
-                # sinon : trop proche, contribution ignoree (cutoff)
-
-        v_total[i, 0] = vx
-        v_total[i, 1] = vy
-        v_total[i, 2] = vz
-    return v_total
-
 class VLMSolver:
     """
     Vortex Lattice Method solver
@@ -75,7 +9,7 @@ class VLMSolver:
     #--------------------#
     #   Initialization   #
     #--------------------#
-    def __init__(self, surfaces, u_inf, boundary, ventilation, correction):
+    def __init__(self, surfaces, u_inf, boundary):
 
         # Flow properties
         self.U        = u_inf      # inflow velocity [m/s]
@@ -88,6 +22,7 @@ class VLMSolver:
         self.N_tot    = None       # total number of panels 
         self.controls = None       # control points of all the real wings
         self.normals  = None       # normals of all the real wings
+        self.c_mean   = None       # mean chord of all the surfaces
 
         # Linear system
         self.A = None       # influence coefficient matrix
@@ -95,43 +30,66 @@ class VLMSolver:
     
         self.rc = None
 
-        # Ventilation 
-        self.vent     = ventilation
-
         self.time=0
 
-        self._get_parameters(correction)
+        self._get_parameters()
 
     #-------------#
     #   Methods   #
     #-------------#
- 
-    def _get_parameters(self,correction):
+    
+    def _correct(self, correction):
         """ 
-        get the global parameters from each surface
+        Correct the normals by rotating them and reset the VLMSolver
+
+        Input :
+            correction -> angle of correction at each section (N_surf,N,)
+        """
+        # reset of the linear system
+        self.A = None       # influence coefficient matrix
+        self.b = None       # right hand side
+        norm  = np.empty((0,3))
+        surfaces = self.surfaces
+        for i,surface in enumerate(surfaces) :
+            surface._reset()
+            surface._set_normals(-correction[i]*surface.orientation)
+            norm = np.concatenate([norm, surface.normals])
+        self.normals = norm
+
+    def _get_parameters(self):
+        """ 
+        Get the global parameters from each surface
+
+        Input :
+            correction -> correction angles for each surface, shape : (Nbr_surfaces, Nbr_panels_spanwise)
         """
         ctrl  = []
         norm  = np.empty((0,3))
         N_tot = 0
         r_min = 0
-        for k,surface in enumerate(self.surfaces):
-            N, M = surface.N, surface.M
+        c     = 0
+        for l,surface in enumerate(self.surfaces):
+            n, m = surface.N, surface.M
+            surface._set_normals(0)
+            norm = np.concatenate([norm, surface.normals])   
+            r_surf = np.linalg.norm(surface.wing["real"][n]-surface.wing["real"][n-1])
+            c += np.mean(surface.chord)
             if N_tot ==0:
-                r_min = np.linalg.norm(surface.wing["real"][N]-surface.wing["real"][N-1])  
-            N_tot = N_tot + M*N
-            for panel in surface.wing_panels["real"] :  
+                r_min = r_surf
+            elif r_surf < r_min :
+                r_min = r_surf
+            N_tot = N_tot + m*n
+            for panel in surface.wing_panels["real"]:  
                 ctrl.append(panel.ctr)     # we compute the normals and control points vector only once
-                norm = np.concatenate([norm, surface._unit_rot(np.array([panel.normal]), -correction[k%surface.N], 2)])   # we rotate the normals to take into account the correction angle of attack
         self.N_tot    = N_tot
         self.controls = np.array(ctrl)
         self.normals  = np.array(norm)
         self.rc       = r_min
+        self.c_mean   = c/(l+1)
 
-
-    def _induced_velocity(self,p,c1,c2,gamma, rc):
-        return _induced_velocity_numba(p,c1,c2,gamma, rc)
-    
-    def _induced_velocityp (self,p,c1,c2,gamma):
+    @staticmethod
+    @nb.njit(parallel=True, fastmath=True)
+    def _induced_velocity(p,c1,c2,gamma, rc):
         """
         Return the velocity induced by the vortex segments [c1, c2], of strentgh gamma,
         at the points p
@@ -141,28 +99,70 @@ class VLMSolver:
         c1    -> starting points of the segments, shape (M,3)
         c2    -> ending points of the segments, shape (M,3)
         gamma -> circulation of each segment, shape (M,)
+        rc   -> cutoff distance for the induced velocity, shape (1,)
 
         Output :
         v     -> velocity induced at each point by each segment, shape (N,3)
         """
-        r1 = p[:, None, :] - c1[None, :, :]    # (N,M,3)
-        r2 = p[:, None, :] - c2[None, :, :]    # (N,M,3)
-        r0 = c2[None, :, :] - c1[None, :, :]   # (1,M,3)
-        r1_norm = np.linalg.norm(r1, axis=2)   # (N,M)
-        r2_norm = np.linalg.norm(r2, axis=2)
-        cross = np.cross(r1, r2)                # (N,M,3)
-        cross_norm2 = np.sum(cross**2, axis=2)  # (N,M)
-        # The safe are needed to avoid division by zero, the value of 1.0 is arbitrary since we will set the velocity to zero in these case
-        eps = 1e-5
-        r2_norm_safe = np.where(r2_norm < eps, 1.0, r2_norm)    
-        r1_norm_safe = np.where(r1_norm < eps, 1.0, r1_norm)    
-        cross_norm2_safe = np.where(cross_norm2 < eps, 1.0, cross_norm2)
-        mask = ((r1_norm > eps) &(r2_norm > eps) &(cross_norm2 > eps))                               # points on or aligned with the segment
-        term = np.sum(r0 * (r1 / r1_norm_safe[:, :, None] - r2 / r2_norm_safe[:, :, None]), axis=2)  # (N,M)
-        coeff = gamma[None, :] / (4 * np.pi)
-        v = coeff[:, :, None] * (cross / cross_norm2_safe[:, :, None]) * term[:, :, None]
-        v[~mask] = 0                    # if one point is on or aligned with the segment, its induced velocity is 0
-        return np.sum(v, axis=1)  # (N,3)
+        N = p.shape[0]
+        M = c1.shape[0]
+        v_total = np.zeros((N, 3), dtype=np.float64)
+
+        eps = rc*1e-10
+        inv4pi = 1.0 / (4.0 * np.pi)
+        d_cut2 = (rc*0.4)**2
+
+        # Parallel loop over points
+        for i in nb.prange(N):
+            px, py, pz = p[i, 0], p[i, 1], p[i, 2]
+            vx = 0.0
+            vy = 0.0
+            vz = 0.0
+
+            for j in range(M):
+
+                rx1 = px - c1[j, 0]
+                ry1 = py - c1[j, 1]
+                rz1 = pz - c1[j, 2]
+
+                rx2 = px - c2[j, 0]
+                ry2 = py - c2[j, 1]
+                rz2 = pz - c2[j, 2]
+
+                r0x = c2[j, 0] - c1[j, 0]
+                r0y = c2[j, 1] - c1[j, 1]
+                r0z = c2[j, 2] - c1[j, 2]
+                r0_norm2 = r0x * r0x + r0y * r0y + r0z * r0z
+
+                cx = ry1 * rz2 - rz1 * ry2
+                cy = rz1 * rx2 - rx1 * rz2
+                cz = rx1 * ry2 - ry1 * rx2
+
+                cross_norm2 = cx * cx + cy * cy + cz * cz
+
+                r1_norm = np.sqrt(rx1 * rx1 + ry1 * ry1 + rz1 * rz1)
+                r2_norm = np.sqrt(rx2 * rx2 + ry2 * ry2 + rz2 * rz2)
+
+                if r0_norm2 > 0.0 and r1_norm > eps and r2_norm > eps:
+                    d2 = cross_norm2 / r0_norm2   # perpendicular distance squared from the point to the segment
+                    if d2 >= d_cut2:
+
+                        dot_term = (
+                            r0x * (rx1 / r1_norm - rx2 / r2_norm)
+                            + r0y * (ry1 / r1_norm - ry2 / r2_norm)
+                            + r0z * (rz1 / r1_norm - rz2 / r2_norm)
+                        )
+
+                        factor = gamma[j] * inv4pi * dot_term / cross_norm2
+
+                        vx += cx * factor
+                        vy += cy * factor
+                        vz += cz * factor
+                    # else : contribution ignored
+            v_total[i, 0] = vx
+            v_total[i, 1] = vy
+            v_total[i, 2] = vz
+        return v_total
     
 
     def _vectorize (self, grid, gamma, n) :
@@ -325,8 +325,10 @@ class VLMSolver:
             F_bound    = np.cross(u_inf + self._induced_velocity(points, c1, c2, gamma_v, self.rc/1000), circ[:,None]*width)                 # loads of the bound segments by Kutta-Joukowski                                  
             F_tot      = np.sum( np.concatenate([F_bound, F_trailing]), axis = 0 ) 
             S = np.sum(np.array([p.area for p in surface.wing_panels["real"]]).reshape(m,n), axis=0)
-            p = surface.plan
-            surface.Cl_2d = 2*np.sum(F_bound[:,p+1].reshape(m, n), axis=0)/(S*u_norm*u_norm) #(-2*p+1) *  # 2D lift coefficient at each spanwise station, reverse the sign if plan is 1 because the z axis point downward
+            normal_lift  = np.linalg.norm(F_bound[:,1:], axis=1)
+            surface.area  = np.sum(S)
+            surface.Cl_2d = 2*np.sum(normal_lift.reshape(m, n), axis=0)/(S*u_norm*u_norm)
+            surface.Cl_old = 2*np.sum(F_bound[:,surface.plan+1].reshape(m, n), axis=0)/(S*u_norm*u_norm)
             surface.loads = F_tot
         
     def _secondary_computation (self):
@@ -372,7 +374,7 @@ class VLMSolver:
             surface.Cl_2d = 2*np.sum(dF[:,1].reshape(m, n), axis=0)/S
             surface.loads = F_tot
 
-    def _time_sim(self, t, dt, distribution):
+    def _time_sim(self, t=None, dt=None, distribution="classic"):
         """ 
         Do the time stepping simulation with the wake relaxation
 
@@ -388,6 +390,10 @@ class VLMSolver:
         boundary = False
         if free_sur=="symmetric" or free_sur=="antisymmetric" :
             boundary = True
+        if t == None :
+            t = 8*self.c_mean/np.linalg.norm(u_inf)
+        if dt == None :
+            dt = t/50
         self._build_A()
         A = self.A
         inv_A = np.linalg.inv(A)
@@ -476,3 +482,58 @@ class VLMSolver:
                             panels = panels + surface._paneling(surface.wake["mirror"]["right"], surface.wake["mirror"]["right"], 1, s+1, span)
                         surface.wake_panels["mirror"] = panels
 
+    def _ventilation(self):
+        """ 
+        Ventilation coupling algorithm
+        """
+        surfaces    = self.surfaces
+        u           = np.linalg.norm(self.U)
+        n           = []                     # number of spanwise panel of each surface
+        correction  = []    
+        Cl          = []
+        slope       = []              
+        # Initialization :
+        self._time_sim()
+        self._kuttas_loads()
+        for i,surface in enumerate(surfaces):
+            n.append(surface.N)
+            correction.append(np.zeros(n[i]))
+            orientation=(1)                                                 # orientation of the normals in comparison to the flow / 1 for upward -1 for downward
+            Cl.append(surface.Cl_2d)
+            # getting the lift coefficient slope to scale the correction
+            CL = 2*np.linalg.norm(surface.loads[1:])/(surface.area*u**2)    # global lift coef
+            mean_normal = np.mean(surface.normals, axis=0)
+            mean_normal_unit = mean_normal / np.linalg.norm(mean_normal)
+            cos_avg = mean_normal_unit[0] 
+            if cos_avg < 0 :
+                orientation = -1
+            surface.orientation = orientation
+            avg_aoa = np.abs(np.arcsin(cos_avg))            # average angle of attack
+            slope.append(CL/avg_aoa) 
+        a0        = 2*np.pi*np.ones_like(Cl)
+        delta_aoa = copy.copy(a0)
+        k         = 0
+        aoa       = copy.copy(a0)            # just for the first test
+        while k<400 and np.max(np.abs(a0*aoa - Cl)) > 1e-2: # np.linalg.norm(a0[0]*aoa[0] - Cl[0])
+            if k == 0 :                     # to ensure that the non ventilated surfaces passes the test
+                a0        = np.copy(Cl)
+                aoa       = np.ones_like(a0)         
+            k += 1
+            for i,surface in enumerate(surfaces):
+                if surface.ventilate :
+                    aoa[i] = (Cl[i]/(2*np.pi))-correction[i]
+                    surface._ventilation_coef(aoa[i].reshape(-1),u)
+                    a0[i] = copy.copy(surface.ventilation["a0"])
+                    delta_aoa[i] = 0.1*(a0[i]*(aoa[i]) - Cl[i])/(slope[i])
+                    correction[i] = correction[i] + delta_aoa[i]        
+            self._correct(correction)
+            self._time_sim()
+            self._kuttas_loads()
+            for i,surface in enumerate(surfaces):
+                if surface.ventilate :
+                    Cl[i] = surface.Cl_2d
+        if k==400:
+            print("Did not converge")
+        for i,surface in enumerate(surfaces):
+                if surface.ventilate :
+                    surface._ventilation_coef(aoa[i].reshape(-1),u)
