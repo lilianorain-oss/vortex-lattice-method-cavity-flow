@@ -13,7 +13,7 @@ class VLMSurface:
     #--------------------#
     #   Initialization   #
     #--------------------#
-    def __init__(self, origin, plan, boundary, shedding, b, c, alpha, beta, lamb, delta, phi, sym, space, n, m, vent):
+    def __init__(self, origin, plan, boundary, shedding, b, c, alpha, beta, lamb, delta, phi, sym, space, n, m, vent, root_ang=0, tip_ang=0, radius=1, center=1):
         
         # Wing geometry
         self.origin    = origin     # starting point of the wing - will end at the middle if it's a symmetric wing
@@ -24,7 +24,10 @@ class VLMSurface:
         self.dihedron  = delta      # dihedral angle            [rad]
         self.twist     = phi        # quarter chord twist angle [rad]
         self.symmetric = sym        # True for a symmetric wing
-
+        self.root_ang  = root_ang   
+        self.tip_ang   = tip_ang
+        self.radius    = radius
+        self.center    = center
         # Discretization parameters
         self.N         = n          # number of spanwise pannels before an eventual symmetry
         self.M         = m          # number of chordwise pannels
@@ -230,7 +233,10 @@ class VLMSurface:
                 s = le*(1-np.cos(theta))/2                      # leading-edge coordinate
         else :
             s = np.linspace(s_min, s_max, (n+1))                # leading-edge coordinate
-        s = np.tile(s,m+1)                                      # grid points z components
+
+        y, z = self._generate_foil(s, self.root_ang, self.tip_ang, self.radius, self.center )
+        y = np.tile(y,m+1)                                      # grid points y components
+        z = np.tile(z,m+1)                                      # grid points z components
 
         # Chordwise wing panels discretiration
         i = np.arange(m+1)[:, None]
@@ -239,7 +245,7 @@ class VLMSurface:
         one = np.ones_like(i)
         ch = ch - one*(j/2) + c[0]/2                            # grid points x components, the chord law is centered  
         ch = ch.reshape(-1)
-        p_wing = np.column_stack((ch, np.zeros_like(s), s)) 
+        p_wing = np.column_stack((ch, y, z)) 
 
         # apply the geometrical transformations
         p_swept = np.column_stack((p_wing[:,2]*np.tan(lamb)+p_wing[:,0],p_wing[:,1],p_wing[:,2]))     # apply sweep
@@ -291,8 +297,81 @@ class VLMSurface:
             self.wing_panels["mirror"] = self._paneling(p_mir, r_mir, 0, n, b)
             self.wing["mirror"]        = r_mir
 
+    def _generate_foil(self, s, root_angle_deg, tip_angle_deg, radius, curve_pos):
+        """
+        Generates the Y and Z coordinates of a parametric foil (C, J, L).
+        Assumes Z is positive downwards. 
+        Strictly preserves the curve length (span).
         
+        Parameters:
+            s              : 1D array of the curvilinear coordinate (e.g., from 0 to s_max).
+            root_angle_deg : Entry angle at the hull (0° = perfectly vertical downwards, 90° = horizontal).
+            tip_angle_deg  : Exit angle at the tip (0° = vertical downwards, 90° = perfectly horizontal).
+            radius         : Bend radius of the curve in meters.
+            curve_pos      : Position of the curve on the remaining straight length (0.0 to 1.0).
+                            - 1.0 = L-Foil (curve pushed maximally towards the tip)
+                            - 0.5 = J-Foil (curve right in the middle)
+                            - 0.0 = Curve immediately starts at the hull
+        Returns:
+            y, z : Arrays of the 2D coordinates.
+        """
+        d_root = np.deg2rad(root_angle_deg)
+        d_tip  = np.deg2rad(tip_angle_deg)
+        
+        # 1. Length of the circular arc
+        L_arc = radius * abs(d_tip - d_root)
+        S_total = s[-1]
+        
+        # Safety check: the radius cannot be so large that the arc exceeds the total span
+        if L_arc > S_total:
+            raise ValueError(f"Radius too large! Arc length ({L_arc:.2f}m) exceeds the span ({S_total:.2f}m).")
+            
+        # 2. Distribution of the remaining straight length
+        L_rem = S_total - L_arc
+        L_shaft = L_rem * curve_pos        # Length of the upper straight section (shaft)
+        L_tip_straight = L_rem - L_shaft   # Length of the lower straight section (tip)
+        
+        # Initialize coordinates
+        y = np.zeros_like(s)
+        z = np.zeros_like(s)
+        
+        # --- MASKS FOR THE 3 SECTIONS ---
+        m_shaft = s <= L_shaft
+        m_arc   = (s > L_shaft) & (s <= L_shaft + L_arc)
+        m_tip   = s > L_shaft + L_arc
+        
+        # --- SECTION 1: The shaft ---
+        y[m_shaft] = s[m_shaft] * np.sin(d_root)
+        z[m_shaft] = s[m_shaft] * np.cos(d_root)
+        
+        # Connection points (end of the shaft)
+        y_shaft_end = L_shaft * np.sin(d_root)
+        z_shaft_end = L_shaft * np.cos(d_root)
+        
+        # --- SECTION 2: The circular arc (elbow) ---
+        if np.any(m_arc):
+            s_arc = s[m_arc] - L_shaft
+            k = (d_tip - d_root) / L_arc  # Rate of angle change (1/R or -1/R depending on direction)
+            
+            # Perfect analytical integration for the arc to guarantee exact curvilinear length
+            delta_s = d_root + k * s_arc
+            y[m_arc] = y_shaft_end - (np.cos(delta_s) - np.cos(d_root)) / k
+            z[m_arc] = z_shaft_end + (np.sin(delta_s) - np.sin(d_root)) / k
+            
+        # Connection points (end of the arc)
+        if L_arc > 0:
+            y_arc_end = y_shaft_end - (np.cos(d_tip) - np.cos(d_root)) / k
+            z_arc_end = z_shaft_end + (np.sin(d_tip) - np.sin(d_root)) / k
+        else:
+            y_arc_end, z_arc_end = y_shaft_end, z_shaft_end
 
+        # --- SECTION 3: The tip ---
+        if np.any(m_tip):
+            s_tip = s[m_tip] - (L_shaft + L_arc)
+            y[m_tip] = y_arc_end + s_tip * np.sin(d_tip)
+            z[m_tip] = z_arc_end + s_tip * np.cos(d_tip)
+            
+        return y, z
 
     def _apply_twist(self):
         """
