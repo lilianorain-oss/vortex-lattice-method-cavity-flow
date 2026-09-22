@@ -48,8 +48,8 @@ class VLMSurface:
         self.gamma_wake  = {"middle":np.array([]), "right":np.array([]), "left":np.array([])}
 
         # secondary computations
-        self.loads       = None             # 3D loads 
-        self.Cl_2d       = None             # lift coef at each section
+        self.loads       = []           # 3D loads 
+        self.Cl_2d       = []             # lift coef at each section
 
     #-------------#
     #   Methods   #
