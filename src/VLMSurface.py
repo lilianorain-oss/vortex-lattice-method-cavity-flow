@@ -13,7 +13,7 @@ class VLMSurface:
     #--------------------#
     #   Initialization   #
     #--------------------#
-    def __init__(self, origin, plan, boundary, shedding, b, c, alpha, beta, lamb, delta, phi, sym, space, n, m, vent, root_ang=0, tip_ang=0, radius=1, center=1):
+    def __init__(self, origin, plan, boundary, shedding, b, c, alpha, beta, lamb, delta, phi, sym, space, n, m, vent, root_ang=0, tip_ang=0, radius=1, center=1, fly_height=0.0):
         
         # Wing geometry
         self.origin    = origin     # starting point of the wing - will end at the middle if it's a symmetric wing
@@ -28,6 +28,7 @@ class VLMSurface:
         self.tip_ang   = tip_ang
         self.radius    = radius
         self.center    = center
+        self.fly_height = fly_height  # flight height [m] - part of the foil above the free surface (z<0) is cut off, 0 = no cut
         # Discretization parameters
         self.N         = n          # number of spanwise pannels before an eventual symmetry
         self.M         = m          # number of chordwise pannels
@@ -273,6 +274,12 @@ class VLMSurface:
         p_geo = p_geo + org
         r_geo = r_geo + org
 
+        # cut the emerged part above the free surface (flight height) before the
+        # global rotations - remaining stations keep the reference mesh size
+        p_geo, r_geo, self.chord, self.span, n = self._truncate_emerged(p_geo, r_geo, m, n)
+        self.N = n
+        b = self.span
+
         # global rotations
         p_attac = self._unit_rot(p_geo,  -alpha, 1)   # incidence rotation                                  
         p_earth = self._unit_rot(p_attac,  -beta, 2)  # drift rotation
@@ -296,6 +303,63 @@ class VLMSurface:
             r_mir = self._symmetry(r_earth, False, np.array([0,0,1]),np.array([0,0,0]),n)
             self.wing_panels["mirror"] = self._paneling(p_mir, r_mir, 0, n, b)
             self.wing["mirror"]        = r_mir
+
+    def _truncate_emerged(self, p_in, r_in, m, n):
+        """
+        Cut the part of the wing above the free surface (z < 0, z positive
+        downwards), applied on the translated geometry before the global
+        rotations. The immersed stations are kept as-is (no resampling), so N
+        decreases with fly_height while the panel size stays the one of the
+        fly_height=0 reference - the first panel is partial (cut through it),
+        or absorbs the next station if the cut leaves less than 81% of a
+        reference panel (sliver merge, to avoid degenerate panels).
+        No-op when fly_height <= 0. The downstream shape (elbow, tip, twist)
+        is preserved exactly since the cut is applied on the built geometry.
+
+        Input:
+            p_in, r_in -> panel and ring corner grids after translation to the
+                          origin, shape ((m+1)*(n+1), 3), root (j=0) to tip (j=n)
+            m, n       -> chordwise / spanwise panel counts
+
+        Output:
+            p_cut, r_cut -> truncated grids, shape ((m+1)*(n_new+1), 3)
+            chord_new    -> chord law of the remaining stations, shape (n_new+1,)
+            span_new     -> immersed span (2 x immersed leading-edge length)
+            n_new        -> remaining spanwise panel count (<= n)
+        """
+        h = self.fly_height
+        if h is None or h <= 0:
+            return p_in, r_in, self.chord, self.span, n
+        if self.symmetric:
+            raise ValueError("fly_height truncation is not supported with symmetric=True (root merged at the middle).")
+        p_grid = p_in.reshape(m+1, n+1, 3)
+        # shallowest corner of each station : the new waterline row is fully
+        # immersed, so no panel corner ends up above water at this stage
+        z_stat = p_grid[:, :, 2].min(axis=0)      # depth of each station
+        if np.all(z_stat < 0):
+            raise ValueError(f"fly_height={h} m fully emerges the wing (deepest station at z={z_stat.max():.4f} m).")
+        if z_stat[0] >= 0:
+            return p_in, r_in, self.chord, self.span, n  # already fully immersed
+        j0 = int(np.argmax(z_stat >= 0))          # first immersed station
+        denom = z_stat[j0] - z_stat[j0-1]
+        f = (0.0 - z_stat[j0-1]) / (denom if abs(denom) > 1e-12 else 1e-12)
+        f = float(np.clip(f, 0.0, 1.0))
+        if (1.0 - f) < 0.81 and j0 < n:
+            # the waterline panel would be a sliver (degenerate influence
+            # coefficients) : absorb station j0, merging it with the first
+            # fully immersed panel instead of cutting
+            j1 = j0 + 1
+        else:
+            j1 = j0
+        r_grid = r_in.reshape(m+1, n+1, 3)
+        # cut grids : interpolated waterline row + immersed stations j1..n (not resampled)
+        p_cut = np.concatenate([((1-f)*p_grid[:, j0-1, :] + f*p_grid[:, j0, :])[:, None, :], p_grid[:, j1:, :]], axis=1)
+        r_cut = np.concatenate([((1-f)*r_grid[:, j0-1, :] + f*r_grid[:, j0, :])[:, None, :], r_grid[:, j1:, :]], axis=1)
+        n_new = p_cut.shape[1] - 1                # remaining panels (<= n)
+        c = np.asarray(self.chord)
+        chord_new = np.concatenate([np.array([(1-f)*c[j0-1] + f*c[j0]]), c[j1:]])
+        span_new = 2*float(np.sum(np.linalg.norm(np.diff(p_cut[0], axis=0), axis=1)))
+        return p_cut.reshape(-1, 3), r_cut.reshape(-1, 3), chord_new, span_new, n_new
 
     def _generate_foil(self, s, root_angle_deg, tip_angle_deg, radius, curve_pos):
         """
@@ -330,6 +394,10 @@ class VLMSurface:
         L_rem = S_total - L_arc
         L_shaft = L_rem * curve_pos        # Length of the upper straight section (shaft)
         L_tip_straight = L_rem - L_shaft   # Length of the lower straight section (tip)
+
+        # Rate of angle change along the arc (defined upfront : no discrete
+        # station may fall inside a small arc, but k is still needed below)
+        k = (d_tip - d_root) / L_arc if L_arc > 0 else 0.0
         
         # Initialize coordinates
         y = np.zeros_like(s)
@@ -351,7 +419,6 @@ class VLMSurface:
         # --- SECTION 2: The circular arc (elbow) ---
         if np.any(m_arc):
             s_arc = s[m_arc] - L_shaft
-            k = (d_tip - d_root) / L_arc  # Rate of angle change (1/R or -1/R depending on direction)
             
             # Perfect analytical integration for the arc to guarantee exact curvilinear length
             delta_s = d_root + k * s_arc
