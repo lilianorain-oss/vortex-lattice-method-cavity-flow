@@ -2,7 +2,6 @@ import numpy as np
 import copy as copy
 import numba as nb
 
-
 class VLMSolver:
     """
     Vortex Lattice Method solver
@@ -10,7 +9,7 @@ class VLMSolver:
     #--------------------#
     #   Initialization   #
     #--------------------#
-    def __init__(self, surfaces, u_inf, boundary, ratio, a_ratio):
+    def __init__(self, surfaces, u_inf=np.array([1,0,0]), boundary="none", ratio=0.08, a_ratio=0.01, k_ratio=0.4):
 
         # Flow properties
         self.U        = u_inf      # inflow velocity [m/s]
@@ -21,18 +20,20 @@ class VLMSolver:
 
         # global parameters
         self.N_tot    = None       # total number of panels 
+        self.N_max    = None       # maximum number of panels in spanwise direction
         self.controls = None       # control points of all the real wings
         self.normals  = None       # normals of all the real wings
+        self.c_mean   = None       # mean chord of all the surfaces
 
         # Linear system
         self.A = None       # influence coefficient matrix
         self.b = None       # right hand side
 
-        # Numerical stability parameters
-        self.c       = None       # mmean chord - used as a reference for the wake cutoff distance
-        self.rc      = None       # minimum panel width - used as a reference for the cutoff distance
-        self.ratio   = ratio      # ratio of the cutoff distance to the minimum panel width
-        self.a_ratio = a_ratio    # ratio of the cutoff distance to the minimum panel width for the A matrix computation
+        # numerical parameter
+        self.ratio   = ratio    # ratio for the wake rollup
+        self.a_ratio = a_ratio  # ratio for linear system
+        self.k_ratio = k_ratio  # ratio for kuttas
+        self.rc = None
 
         self.time=0
 
@@ -41,31 +42,67 @@ class VLMSolver:
     #-------------#
     #   Methods   #
     #-------------#
- 
+    
+    def _correct(self, correction):
+        """ 
+        Correct the normals by rotating them and reset the VLMSolver
+
+        Input :
+            correction -> angle of correction at each section (N_surf,N,)
+        """
+        # reset of the linear system
+        self.A = None       # influence coefficient matrix
+        self.b = None       # right hand side
+        norm  = np.empty((0,3))
+        surfaces = self.surfaces
+        for i,surface in enumerate(surfaces) :
+            surface._reset()
+            surface._set_normals(-correction[i]*surface.orientation)
+            norm = np.concatenate([norm, surface.normals])
+        self.normals = norm
+
     def _get_parameters(self):
         """ 
-        get the global parameters from each surface
+        Get the global parameters from each surface
+
+        Input :
+            correction -> correction angles for each surface, shape : (Nbr_surfaces, Nbr_panels_spanwise)
         """
         ctrl  = []
-        norm  = []
+        norm  = np.empty((0,3))
         N_tot = 0
-        r_min = 100
-        c     = 100
-        for surface in self.surfaces :
-            r_surf = np.linalg.norm(surface.wing["real"][surface.N] - surface.wing["real"][surface.N-1])   
-            if r_surf < r_min :
+        n_max = 0
+        r_min = 0
+        c     = 0
+        for l,surface in enumerate(self.surfaces):
+            n, m = surface.N, surface.M
+            if n > n_max :
+                n_max = n
+            surface._reset()
+            orientation = np.ones(n)
+            surface._set_normals(0)
+            norm = np.concatenate([norm, surface.normals])   
+            norm_sec = np.mean(surface.normals.reshape(m,n,3), axis=0)
+            cos = norm_sec[:,0]
+            for k in range(n):
+                if cos[k]<0:
+                    orientation[k] = -1
+            surface.orientation = orientation
+            r_surf = np.min(np.array([np.linalg.norm(surface.wing["real"][n]-surface.wing["real"][n-1]),np.linalg.norm(surface.wing["real"][1]-surface.wing["real"][(n+2)])]))
+            c += np.mean(surface.chord)
+            if N_tot ==0:
                 r_min = r_surf
-            if np.mean(surface.chord) < c :
-                c = np.mean(surface.chord)
-            N_tot += surface.N * surface.M
-            for panel in surface.wing_panels["real"] :
+            elif r_surf < r_min :
+                r_min = r_surf
+            N_tot = N_tot + m*n
+            for panel in surface.wing_panels["real"]:  
                 ctrl.append(panel.ctr)     # we compute the normals and control points vector only once
-                norm.append(panel.normal)
         self.N_tot    = N_tot
         self.controls = np.array(ctrl)
         self.normals  = np.array(norm)
         self.rc       = r_min
-        self.c        = c
+        self.c_mean   = c/(l+1)
+        self.N_max    = n_max
 
     @staticmethod
     @nb.njit(parallel=True, fastmath=True)
@@ -223,7 +260,7 @@ class VLMSolver:
                     else :
                         gamma_tot = np.concatenate([gamma_tot, -gamma_v, -gamma_vl, -gamma_vr]) 
         return c1_tot, c2_tot, gamma_tot
-
+            
     def _build_A (self):
         """
         Construct the influence coefficients matrix A by computing the velocity induced at each control point by each vortex ring,
@@ -239,15 +276,15 @@ class VLMSolver:
                 v = surface.wing_panels["real"][i].vrt
                 c1 = np.array([v[0], v[1],v[2], v[3]]).reshape(-1,3)                
                 c2 = np.array([v[1], v[2],v[3], v[0]]).reshape(-1,3)
-                v_ring = self._induced_velocity(ctrl, c1, c2, np.array([1,1,1,1]), self.rc*self.a_ratio, 0)  # velocity induced at each control point by the vortex ring of panel j (global) / i (local)
+                v_ring = self._induced_velocity(ctrl, c1, c2, np.array([1,1,1,1]), self.a_ratio*self.rc, 0)  # velocity induced at each control point by the vortex ring of panel j (global) / i (local)
                 if self.boundary=="symmetric" or self.boundary=="antisymmetric" :
                     v = surface.wing_panels["mirror"][i].vrt
                     c1 = np.array([v[0], v[1],v[2], v[3]]).reshape(-1,3)                
                     c2 = np.array([v[1], v[2],v[3], v[0]]).reshape(-1,3)
                     if self.boundary=="symmetric":
-                        v_ring = v_ring + self._induced_velocity(ctrl, c1, c2, -np.array([1,1,1,1]), self.rc*self.a_ratio, 0)    # velocity induced at each control point by the vortex mirror ring of panel j (global) / i (local)
+                        v_ring = v_ring + self._induced_velocity(ctrl, c1, c2, -np.array([1,1,1,1]), self.a_ratio*self.rc, 0)    # velocity induced at each control point by the vortex mirror ring of panel j (global) / i (local)
                     else :
-                        v_ring = v_ring + self._induced_velocity(ctrl, c1, c2, np.array([1,1,1,1]), self.rc*self.a_ratio, 0)    # velocity induced at each control point by the vortex mirror ring of panel j (global) / i (local)
+                        v_ring = v_ring + self._induced_velocity(ctrl, c1, c2, np.array([1,1,1,1]), self.a_ratio*self.rc, 0)
                 A[:,j] = np.sum(v_ring * norm, axis=1)                                           # projection of the induced velocity on the normal direction of each panel
                 j += 1
         self.A = A
@@ -268,7 +305,7 @@ class VLMSolver:
             v = np.tile(np.array([0,0,0]), (n,1))
         else :
             c1, c2, gamma_v = self._full_vectorize(False)
-            v = self._induced_velocity(ctrl, c1, c2, gamma_v, self.rc*self.a_ratio, 0)                 # velocity induced at each control point by the wake vortex rings
+            v = self._induced_velocity(ctrl, c1, c2, gamma_v, self.a_ratio*self.rc, 0)                 # velocity induced at each control point by the wake vortex rings
         b = -np.sum((v + u_inf) * normal, axis=1)
         self.b = b
 
@@ -297,7 +334,7 @@ class VLMSolver:
             for k,p in enumerate(wing_panels["real"]):
                 width.append(p.vrt[1]-p.vrt[0])             # width of each bound segment
                 points.append((p.vrt[0] + p.vrt[1])/2)      # mid bound segment points
-                if k%n != 0 :                                   # tips are not taken into account TODO tip shedding
+                if k%n != 0 :                                   # tips are not taken into account
                     chords.append(p.vrt[0] - p.vrt[3])          # length of each trailing segment
                     points_t.append((p.vrt[0] + p.vrt[3])/2)    # mid trailing segment points
             width    = np.array(width)
@@ -305,18 +342,29 @@ class VLMSolver:
             chords   = np.array(chords)
             points_t = np.array(points_t)
             c1, c2, gamma_v = self._full_vectorize(True)
-            F_trailing = np.cross(u_inf_t + self._induced_velocity(points_t, c1, c2, gamma_v, 0, self.rc*self.a_ratio), circ_t[:,None]*chords)          # loads of the trailing segments by Kutta-Joukowski
-            F_bound    = np.cross(u_inf + self._induced_velocity(points, c1, c2, gamma_v, 0, self.rc*self.a_ratio), circ[:,None]*width)                 # loads of the bound segments by Kutta-Joukowski                                  
-            F_tot      = np.sum( np.concatenate([F_bound, F_trailing]), axis = 0 ) 
+            # at first we do not take into account the induced velocity as it distorts the Cl distribution
+            F_trailing = np.cross(u_inf_t, circ_t[:,None]*chords)          # loads of the trailing segments by Kutta-Joukowski
+            F_bound    = np.cross(u_inf, circ[:,None]*width)               # loads of the bound segments by Kutta-Joukowski                                  
             S = np.sum(np.array([p.area for p in surface.wing_panels["real"]]).reshape(m,n), axis=0)
-            p = surface.plan
-            surface.Cl_2d.append(2*np.sum(F_bound[:,p+1].reshape(m, n), axis=0)/(S*u_norm*u_norm)) #(-2*p+1) *  # 2D lift coefficient at each spanwise station, reverse the sign if plan is 1 because the z axis point downward
-            surface.loads.append(F_tot)
+            normal_lift  = np.linalg.norm(F_bound[:,1:], axis=1)
+            width_norm    = np.linalg.norm(width[:,1:], axis=1).reshape(m,n).mean(axis=0)         # x component not taken into account as when plotted it is neither 
+            loads_distrib = np.sum(normal_lift.reshape(m, n), axis=0)/width_norm
+            # taking into account the induced velocity in order to vompute the induced drag and improve the precision of the global loads
+            F_trailing = F_trailing + np.cross(self._induced_velocity(points_t, c1, c2, gamma_v, 0, self.k_ratio*self.rc), circ_t[:,None]*chords)          # loads of the trailing segments by Kutta-Joukowski
+            F_bound    = F_bound + np.cross(self._induced_velocity(points, c1, c2, gamma_v, 0, self.k_ratio*self.rc), circ[:,None]*width)                 # loads of the bound segments by Kutta-Joukowski                                  
+            F_tot      = np.sum( np.concatenate([F_bound, F_trailing]), axis = 0 ) 
+            surface.area  = np.sum(S)
+            surface.loads_distrib = loads_distrib/np.max(loads_distrib)
+            surface.Cl_2d  = 2*np.sum(normal_lift.reshape(m, n), axis=0)/(S*u_norm*u_norm)
+            surface.loads  = F_tot
+            surface.CL     = 2*np.linalg.norm(F_tot[1:])/(np.sum(S)*u_norm*u_norm)
+            surface.CD     = 2*np.linalg.norm(F_tot[0])/(np.sum(S)*u_norm*u_norm)
+            
         
     def _secondary_computation (self):
         """ 
         Compute the loads using the pressure difference between the two sides of each panel, and summing up all the contributions
-
+        not updated
 
         """
         u_inf = self.U
@@ -330,7 +378,6 @@ class VLMSolver:
             normals = np.array([p.normal for p in panels])
             u_inf   = np.tile(u_inf, (n*m, 1))
             dp      = []
-            print("gamma :", gamma)
             d_gam_i = np.concatenate([gamma[n:],gamma_w["middle"][:n]]) - np.concatenate([np.zeros_like(gamma[:n]), gamma[:n*(m-1)]])     # delta circulation at each control point in the chordwise direction   
             # delta circulation at each control point in the spanwise direction
             if surface.tip_shed == "both":  
@@ -344,20 +391,20 @@ class VLMSolver:
                 d_gam_j = np.hstack([gamma.reshape(m, n)[:,1:],gamma.reshape(m, n)[:,-1][:,None]]).reshape(-1) - np.hstack([gamma_w["left"].reshape(m,n_w)[:,-1][:,None], gamma.reshape(m, n)[:,:-1]]).reshape(-1)
             else :
                 d_gam_j = np.hstack([gamma.reshape(m, n)[:,1:],gamma.reshape(m, n)[:,-1][:,None]]).reshape(-1) - np.hstack([gamma.reshape(m, n)[:,0][:,None], gamma.reshape(m, n)[:,:-1]]).reshape(-1)
-            print("dekta gam I : ",d_gam_i)
-            print("delta gam J : ",d_gam_j)
             
             taux_i  = np.array([p.chord/(np.linalg.norm(p.chord)**2) for p in panels])          # chordwise unit vector divided by the mean chord length, for each panel
             taux_j  = np.array([p.width/(np.linalg.norm(p.width)**2) for p in panels])          # spanwise unit vector divided by the mean width, for each panel
             S       = np.array([p.area for p in panels])                                        # area of each panel
             c1, c2, gamma_v = self._full_vectorize(False)
-            V       = u_inf + self._induced_velocity(ctrl, c1, c2, gamma_v)
+            V       = u_inf #+ self._induced_velocity(ctrl, c1, c2, gamma_v)
             dp      = np.sum(V * (taux_i*d_gam_i[:,None]/2 + taux_j*d_gam_j[:,None]/2), axis=1) 
             dF      = -dp[:,None]*S[:,None]*normals                                  
             F_tot   = np.sum(dF, axis = 0)
+            S = np.sum(np.array([p.area for p in surface.wing_panels["real"]]).reshape(m,n), axis=0)
+            surface.Cl_2d = 2*np.sum(dF[:,1].reshape(m, n), axis=0)/S
             surface.loads = F_tot
 
-    def _time_sim(self, t, dt, distribution):
+    def _time_sim(self, t=None, dt=None, distribution="classic", computations=[]):
         """ 
         Do the time stepping simulation with the wake relaxation
 
@@ -365,14 +412,21 @@ class VLMSolver:
             t            -> total simulation time
             dt           -> time step length
             distribution -> type of time step distribution
+            computations -> times on which Cl need to be computed
         """
         # Initialization
         u_inf    = self.U
         surfaces = self.surfaces
         free_sur = self.boundary
         boundary = False
+        CL       = []
+        Cl_2d    = []
         if free_sur=="symmetric" or free_sur=="antisymmetric" :
             boundary = True
+        if t == None :
+            t = 10*self.c_mean/np.linalg.norm(u_inf)
+        if dt == None :
+            dt = 5*self.c_mean/np.linalg.norm(u_inf)/self.N_max
         self._build_A()
         A = self.A
         inv_A = np.linalg.inv(A)
@@ -398,9 +452,9 @@ class VLMSolver:
             n_gamma = 0                 # give the start of Gamma in Gamma_tot for each surface
             for surface in surfaces:
                 n, m   = surface.N, surface.M 
-                wake   = surface.wake["real"]["middle"]
-                l_wake = surface.wake["real"]["left"]
-                r_wake = surface.wake["real"]["right"]
+                wake   = copy.copy(surface.wake["real"]["middle"])
+                l_wake = copy.copy(surface.wake["real"]["left"])
+                r_wake = copy.copy(surface.wake["real"]["right"])
                 # simulate the wing advancement
                 wake   = wake + dta[s]*u_inf
                 l_wake = l_wake + dta[s]*u_inf
@@ -432,14 +486,14 @@ class VLMSolver:
                 wake   = surface.wake["real"]["middle"]
                 l_wake = surface.wake["real"]["left"]
                 r_wake = surface.wake["real"]["right"]
-                wake   = wake + np.concatenate([np.zeros((n+1,3)), dta[s]*self._induced_velocity(wake[n+1:], c1, c2, gamma_v, 0 , self.c*self.ratio)])    # each corner point except at the edges are convect by the induced velocity
+                wake   = wake + np.concatenate([np.zeros((n+1,3)), dta[s]*self._induced_velocity(wake[n+1:], c1, c2, gamma_v, 0, self.c_mean*self.ratio)])    # each corner point except at the edges are convect by the induced velocity
                 l_wake = l_wake + np.hstack([
-                    dta[s]*self._induced_velocity(l_wake.reshape(m+1, s+2, 3)[:,:s+1].reshape(-1, 3), c1, c2, gamma_v, 0 , self.c*self.ratio).reshape(m+1, s+1, 3),
+                    dta[s]*self._induced_velocity(l_wake.reshape(m+1, s+2, 3)[:,:s+1].reshape(-1, 3), c1, c2, gamma_v, 0, self.c_mean*self.ratio).reshape(m+1, s+1, 3),
                     np.zeros((m+1,1,3))
                     ]).reshape(-1, 3)                               # reshape in 2D grid to not take into account the tip edge
                 r_wake = r_wake + np.hstack([
                     np.zeros((m+1,1,3)), 
-                    dta[s]*self._induced_velocity(r_wake.reshape(m+1, s+2, 3)[:,1:].reshape(-1, 3), c1, c2, gamma_v, 0, self.c*self.ratio).reshape(m+1, s+1, 3),
+                    dta[s]*self._induced_velocity(r_wake.reshape(m+1, s+2, 3)[:,1:].reshape(-1, 3), c1, c2, gamma_v, 0, self.c_mean*self.ratio).reshape(m+1, s+1, 3),
                     ]).reshape(-1, 3)
                 surface._update_wake([wake, l_wake, r_wake])
                 # at the last step we build the wake panels, usefull for plotting
@@ -460,5 +514,74 @@ class VLMSolver:
                         if ( surface.tip_shed == "right" ) or ( surface.tip_shed == "both" ) :
                             panels = panels + surface._paneling(surface.wake["mirror"]["right"], surface.wake["mirror"]["right"], 1, s+1, span)
                         surface.wake_panels["mirror"] = panels
-            if s==round(2/dt) or s==round(5/dt) or s==round(10/dt) or s==round(15/dt) or s==round(20/dt) : # 
+            # computing load if needed at this time step
+            if (s+1)*dt in computations :
                 self._kuttas_loads()
+                C, c = [], []
+                for surface in surfaces :
+                    C.append(surface.CL)
+                    c.append(surface.Cl_2d)
+                CL.append(C)
+                Cl_2d.append(c)
+            if s == round(t/dt)-1 :
+                for surface in surfaces :
+                    surface.CL = CL  
+                    surface.Cl_2d = Cl_2d
+
+
+    def _ventilation(self):
+        """ 
+        Ventilation coupling algorithm
+        """
+        surfaces    = self.surfaces
+        u           = np.linalg.norm(self.U)
+        n           = []                     # number of spanwise panel of each surface
+        correction  = []    
+        Cl          = []
+        slope       = []              
+        # Initialization :
+        self._correct([0 for i in range(self.N_tot)])       # reseting the solver in case it already had done simulations
+        self._time_sim()
+        self._kuttas_loads()
+        for i,surface in enumerate(surfaces):
+            n.append(surface.N)
+            correction.append(np.zeros(n[i]))
+            orientation=(1)                                                 # orientation of the normals in comparison to the flow / 1 for upward -1 for downward
+            Cl.append(surface.Cl_2d)
+            # getting the lift coefficient slope to scale the correction
+            CL = 2*np.linalg.norm(surface.loads[1:])/(surface.area*u**2)    # global lift coef
+            # average angle of attack
+            cos = surface.normals[:,0]
+            aoa = np.abs(np.arcsin(cos))
+            avg_aoa = np.mean(aoa)
+            slope.append(CL/avg_aoa) 
+        a0        = [2 * np.pi * np.ones_like(c) for c in Cl]
+        delta_aoa = [np.copy(a) for a in a0]
+        aoa       = [np.copy(a) for a in a0]
+        k         = 0
+        def _res():
+            return max(float(np.max(np.abs(a * o - c))) for a, o, c in zip(a0, aoa, Cl))
+        while k < 400 and _res() > 1e-3:
+            if k == 0:
+                a0  = [np.copy(c) for c in Cl]
+                aoa = [np.ones_like(c) for c in Cl]        
+            k += 1
+            for i,surface in enumerate(surfaces):
+                if surface.ventilate :
+                    aoa[i] = (Cl[i]/(2*np.pi*np.cos(surface.sweep)))-correction[i]
+                    surface._ventilation_coef(aoa[i].reshape(-1),u)
+                    a0[i] = copy.copy(surface.ventilation["a0"])
+                    delta_aoa[i] = 0.1*(a0[i]*(aoa[i]) - Cl[i])/(slope[i])
+                    correction[i] = correction[i] + delta_aoa[i]        
+            self._correct(correction)
+            self._time_sim()
+            self._kuttas_loads()
+            for i,surface in enumerate(surfaces):
+                if surface.ventilate :
+                    Cl[i] = surface.Cl_2d
+        if k==400:
+            print("Did not converge")
+        for i,surface in enumerate(surfaces):
+                if surface.ventilate :
+                    surface._ventilation_coef(aoa[i].reshape(-1),u)
+                    surface.ventilation["avg_aoa"] = avg_aoa
