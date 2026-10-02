@@ -13,7 +13,7 @@ class VLMSurface:
     #--------------------#
     #   Initialization   #
     #--------------------#
-    def __init__(self, origin, plan, boundary, shedding, b, c, alpha, beta, lamb, delta, phi, sym, space, n, m, vent, root_ang=0, tip_ang=0, radius=1, center=1, fly_height=0.0):
+    def __init__(self, origin=np.array([0,0,0]), plan=0, boundary="none", shedding="both", b=1, c=None, alpha=0, beta=0, lamb=0, delta=0, phi=0, sym=False, space=False, n=10, m=10, vent=True, root_ang=0, tip_ang=0, radius=1, center=1, fly_height=0.0):
         
         # Wing geometry
         self.origin    = origin     # starting point of the wing - will end at the middle if it's a symmetric wing
@@ -29,6 +29,7 @@ class VLMSurface:
         self.radius    = radius
         self.center    = center
         self.fly_height = fly_height  # flight height [m] - part of the foil above the free surface (z<0) is cut off, 0 = no cut
+        
         # Discretization parameters
         self.N         = n          # number of spanwise pannels before an eventual symmetry
         self.M         = m          # number of chordwise pannels
@@ -36,8 +37,8 @@ class VLMSurface:
 
         # Simulation parameters
         self.boundary  = boundary   # True create a mirror image to model the free surface on the x-y plan
-        self.aoa       = alpha      # geometric angle of attack [rad]   -> axe = -y
-        self.drift     = beta       # geometric angle of drift  [rad]   -> axe = -z
+        self.aoa       = alpha      # geometric pitch angle   [rad]   -> axe = -y
+        self.drift     = beta       # geometric leeway angle  [rad]   -> axe = -z
         self.tip_shed  = shedding   # enable the tip shedding - both -> both tips ; right -> only right tip ; left -> only left tip ; none -> both disable
                                     # left and right are defined for an horizontal wing, for a vertical one left <-> top and right <-> bottom
         self.ventilate = vent       # True enables the ventilation on the surface
@@ -56,9 +57,12 @@ class VLMSurface:
         self.gamma_wake  = {"middle":np.array([]), "right":np.array([]), "left":np.array([])}
 
         # secondary computations
-        self.loads       = None             # 3D loads 
-        self.Cl_2d       = None             # normal lift coef at each section
-        self.area        = None             # total area of the surface
+        self.loads         = None             # 3D total loads 
+        self.loads_distrib = None             # distribution of the normal loads
+        self.CL            = None             # global lift coef
+        self.CD            = None             # global induced drag coef
+        self.Cl_2d         = None             # normal lift coef at each section
+        self.area          = None             # total area of the surface
 
         # ventilation 
         self.ventilation = {}               # ventilation output : a0, alpha_eff, sigma_c, Lc/c 
@@ -221,7 +225,11 @@ class VLMSurface:
         org   = self.origin
 
         # Leading-edge length of the semi-wing
-        le = (0.5 * b)
+        
+        if self.symmetric :
+            le = (0.5 * b)
+        else :
+            le = b
         s_min, s_max = 0.0, le
 
         # Spanwise wing discretization, taking the symmetry and spacing parameters into account
@@ -531,4 +539,113 @@ class VLMSurface:
         self.ventilation["sigma_c"]   = sigma_c
         self.ventilation["Lc/c"]      = Lc
         self.ventilation["froude"]    = froude
+
+    def _spanwise_coord(self):
+        """
+        Normalized spanwise coordinate of each section.
+
+        Reference of each section is its control point (mean of the column
+        control points), measured as curvilinear length in the (y, z) plane
+        from the first section and divided by the span. Exact for arc shapes
+        while ignoring the chordwise (x) offsets from sweep shear and
+        chord-law centering, so uniform and cosine spacing give the same
+        geometric extent (control points stay strictly inside the span).
+        """
+        m, n = self.M, self.N
+        panels = self.wing_panels["real"]
+        ctrl = np.array([panels[i*n + j].ctr for j in range(n) for i in range(m)]).reshape(n, m, 3).mean(axis=1)
+        ctrl = ctrl[:, 1:]                                                        # span plane (y, z): sweep-shear excluded
+        s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(ctrl, axis=0), axis=1))])
+        return s / self.span
+
+    def plot_Cl_2d(self):
+        """
+        Plot the sectional lift coefficient along the curvilinear span.
+
+        Abscissa is the curvilinear coordinate of each section control point,
+        normalized by the span (exact for arc shapes, sweep-shear excluded).
+        Labelled "z/b" if plan == 0, "y/b" if plan == 1.
+        """
+        if self.Cl_2d is None:
+            raise ValueError("Cl_2d is None, run the solver first.")
+        import matplotlib.pyplot as plt
+        x = self._spanwise_coord()
+        xlabel = r'$y/b$' if self.plan == 1 else r'$z/b$'
+        plt.figure(figsize=(8,4))
+        plt.plot(x, np.asarray(self.Cl_2d))
+        plt.xlabel(xlabel)
+        plt.ylabel(r'$C_l$')
+        plt.ylim(0,1.1*np.max(self.Cl_2d))
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+    def plot_load(self):
+        """
+        Plot the sectional load along the curvilinear span.
+
+        Abscissa is the curvilinear coordinate of each section control point,
+        normalized by the span (exact for arc shapes, sweep-shear excluded).
+        Labelled "z/b" if plan == 0, "y/b" if plan == 1.
+        """
+        if self.Cl_2d is None:
+            raise ValueError("Cl_2d is None, run the solver first.")
+        import matplotlib.pyplot as plt
+        x = self._spanwise_coord()
+        xlabel = r'$y/b$' if self.plan == 1 else r'$z/b$'
+        plt.figure(figsize=(8,4))
+        plt.plot(x, np.asarray(self.loads_distrib))
+        plt.xlabel(xlabel)
+        plt.ylabel(r'$l/l_\text{\max}$')
+        plt.ylim(0,1.1*np.max(self.loads_distrib))
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+    def plot_area(self):
+        """
+        Plot the area of each section along the curvilinear span.
+
+        Abscissa is the curvilinear coordinate of each section control point,
+        normalized by the span (exact for arc shapes, sweep-shear excluded).
+        Labelled "z/b" if plan == 0, "y/b" if plan == 1.
+        """
+        if self.Cl_2d is None:
+            raise ValueError("Cl_2d is None, run the solver first.")
+        import matplotlib.pyplot as plt
+        x = self._spanwise_coord()
+        xlabel = r'$y/b$' if self.plan == 1 else r'$z/b$'
+        plt.figure(figsize=(8,4))
+        S = np.sum(np.array([p.area for p in self.wing_panels["real"]]).reshape(self.M,self.N), axis=0)
+        plt.plot(x, np.asarray(S))
+        plt.xlabel(xlabel)
+        plt.ylabel(r'$S$')
+        plt.ylim(0,1.1*np.max(S))
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+        
+    def plot_gamma(self):
+        """
+        Plot the spanwise circulation (summed chordwise) along the curvilinear span.
+
+        Abscissa is the curvilinear coordinate of each section control point,
+        normalized by the span (exact for arc shapes, sweep-shear excluded).
+        Labelled "z/b" if plan == 0, "y/b" if plan == 1.
+        """
+        if self.gamma is None or np.size(self.gamma) == 0:
+            raise ValueError("gamma is empty, run the solver first.")
+        import matplotlib.pyplot as plt
+        m, n = self.M, self.N
+        circ =np.abs( np.sum(np.asarray(self.gamma).reshape(m, n), axis=0))
+        circ = circ / np.max(circ)  # normalize for plotting
+        x = self._spanwise_coord()
+        xlabel = r'$y/b$' if self.plan == 1 else r'$z/b$'
+        plt.figure(figsize=(8,4))
+        plt.plot(x, circ)
+        plt.xlabel(xlabel)
+        plt.ylabel(r'$\Gamma/\Gamma_\text{\max}$')
+        plt.ylim(0,1.1*np.max(circ))
+        plt.grid(True)
+        plt.show()
 
