@@ -1,0 +1,6 @@
+# Runtime dependencies (unpinned on purpose — research prototype).
+# Install manually:  pip install -r requirements.txt
+numpy
+numba
+matplotlib
+jupyter

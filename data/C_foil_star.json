@@ -1,0 +1,36 @@
+{
+ "name": "C_foil_star",
+ "entries": {
+  "ox": "0.0",
+  "oy": "1",
+  "oz": "0",
+  "span": "1.13",
+  "alpha": "7",
+  "beta": "2",
+  "sweep": "0.0",
+  "dihedral": "0.0",
+  "twist": "0",
+  "rake": "0.0",
+  "n": "20",
+  "m": "8",
+  "root_ang": "20",
+  "tip_ang": "-60",
+  "radius": "0.5",
+  "center": "0.5",
+  "fly_h": "0",
+  "c0": "0.1",
+  "AR": "1.0",
+  "lam": "1.8",
+  "chord": "0.16       0.16       0.16       0.16       0.16       0.16\n 0.16       0.16       0.16       0.16       0.16       0.16\n 0.16       0.16       0.15652302 0.14552296 0.12876303 0.10818932\n 0.08642256 0.06788518 0.06    ",
+  "c_line": "1"
+ },
+ "vars": {
+  "plan": "0",
+  "boundary": "antisymmetric",
+  "shedding": "right",
+  "sym": false,
+  "space": true,
+  "vent": true,
+  "chord_mode": "custom"
+ }
+}
