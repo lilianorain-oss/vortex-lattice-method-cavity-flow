@@ -13,13 +13,14 @@ class VLMSurface:
     #--------------------#
     #   Initialization   #
     #--------------------#
-    def __init__(self, origin=np.array([0,0,0]), plan=0, boundary="none", shedding="both", b=1, c=None, alpha=0, beta=0, lamb=0, delta=0, phi=0, sym=False, space=False, n=10, m=10, vent=True, root_ang=0, tip_ang=0, radius=1, center=1, fly_height=0.0):
+    def __init__(self, origin=np.array([0,0,0]), plan=0, boundary="none", shedding="both", b=1, c=None, alpha=0, beta=0, lamb=0, delta=0, phi=0, sym=False, space=False, n=10, m=10, vent=True, root_ang=0, tip_ang=0, radius=1, center=1, fly_height=0.0, c_line=0.5):
         
         # Wing geometry
         self.origin    = origin     # starting point of the wing - will end at the middle if it's a symmetric wing
         self.plan      = plan       # plan in wich the wing is based - 0 for z-x, 1 for y-x
         self.span      = b          # wing span
         self.chord     = c          # chord law distribution
+        self.c_line    = c_line     # chord law reference line - 0 for leading edge, 0.5 for middle, 1 for trailing edge
         self.sweep     = lamb       # middle chord sweep angle  [rad]
         self.dihedron  = delta      # dihedral angle            [rad]
         self.twist     = phi        # quarter chord twist angle [rad]
@@ -216,13 +217,14 @@ class VLMSurface:
         """
         m = self.M
         n = self.N
-        b     = self.span
-        alpha = self.aoa
-        beta  = self.drift
-        lamb  = self.sweep
-        delta = self.dihedron
-        c     = self.chord
-        org   = self.origin
+        b      = self.span
+        alpha  = self.aoa
+        beta   = self.drift
+        lamb   = self.sweep
+        delta  = self.dihedron
+        c      = self.chord
+        org    = self.origin
+        c_line = self.c_line
 
         # Leading-edge length of the semi-wing
         
@@ -252,7 +254,7 @@ class VLMSurface:
         j = c[None, :]
         ch = (i/m) * j                                          # chordwise discretization at each spanwise station
         one = np.ones_like(i)
-        ch = ch - one*(j/2) + c[0]/2                            # grid points x components, the chord law is centered  
+        ch = ch - one*j*c_line + c[0]*c_line                    # grid points x components, the chord law is centered according to c_line 
         ch = ch.reshape(-1)
         p_wing = np.column_stack((ch, y, z)) 
 
@@ -282,17 +284,18 @@ class VLMSurface:
         p_geo = p_geo + org
         r_geo = r_geo + org
 
-        # cut the emerged part above the free surface (flight height) before the
-        # global rotations - remaining stations keep the reference mesh size
-        p_geo, r_geo, self.chord, self.span, n = self._truncate_emerged(p_geo, r_geo, m, n)
-        self.N = n
-        b = self.span
-
         # global rotations
         p_attac = self._unit_rot(p_geo,  -alpha, 1)   # incidence rotation                                  
         p_earth = self._unit_rot(p_attac,  -beta, 2)  # drift rotation
         r_attac = self._unit_rot(r_geo,  -alpha, 1)                                                   
         r_earth = self._unit_rot(r_attac,  -beta, 2)
+
+        # cut the emerged part above the free surface (flight height) after the
+        # global rotations : the waterline row lands exactly on z=0, flush with
+        # the free surface. Remaining stations keep the reference mesh size
+        p_earth, r_earth, self.chord, self.span, n = self._truncate_emerged(p_earth, r_earth, m, n)
+        self.N = n
+        b = self.span
 
         self.wing_panels["real"] = self._paneling(p_earth, r_earth, 0, n, b)
         self.wing["real"]        = r_earth
@@ -315,8 +318,9 @@ class VLMSurface:
     def _truncate_emerged(self, p_in, r_in, m, n):
         """
         Cut the part of the wing above the free surface (z < 0, z positive
-        downwards), applied on the translated geometry before the global
-        rotations. The immersed stations are kept as-is (no resampling), so N
+        downwards), applied after the global rotations so the waterline row
+        lands exactly on z=0, flush with the free surface. The immersed
+        stations are kept as-is (no resampling), so N
         decreases with fly_height while the panel size stays the one of the
         fly_height=0 reference - the first panel is partial (cut through it),
         or absorbs the next station if the cut leaves less than 81% of a
@@ -366,7 +370,7 @@ class VLMSurface:
         n_new = p_cut.shape[1] - 1                # remaining panels (<= n)
         c = np.asarray(self.chord)
         chord_new = np.concatenate([np.array([(1-f)*c[j0-1] + f*c[j0]]), c[j1:]])
-        span_new = 2*float(np.sum(np.linalg.norm(np.diff(p_cut[0], axis=0), axis=1)))
+        span_new = float(np.sum(np.linalg.norm(np.diff(p_cut[0], axis=0), axis=1)))
         return p_cut.reshape(-1, 3), r_cut.reshape(-1, 3), chord_new, span_new, n_new
 
     def _generate_foil(self, s, root_angle_deg, tip_angle_deg, radius, curve_pos):

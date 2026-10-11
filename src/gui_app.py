@@ -53,10 +53,10 @@ DEG = np.pi / 180.0
 # (chord c0/AR are app-level: the code default c=None cannot build a mesh.)
 SURFACE_DEFAULTS = dict(ox=0.0, oy=0.0, oz=0.0, plan=0, boundary="none",
                         shedding="both", span=1.0, chord_mode="rectangular", c0=0.1,
-                        AR=1.0, lam=1.8, alpha=0.0, beta=0.0, sweep=0.0,
-                        dihedral=0.0, twist="0", n=10, m=10, sym=False,
+                        AR=1.0, lam=1.8, chord="", alpha=0.0, beta=0.0, sweep=0.0,
+                        dihedral=0.0, twist="0", rake=0.0, n=10, m=10, sym=False,
                         space=False, vent=True, root_ang=0.0, tip_ang=0.0,
-                        radius=1.0, center=1.0, fly_h=0.0)
+                        radius=1.0, center=1.0, fly_h=0.0, c_line=0.5)
 SOLVER_DEFAULTS = dict(ux=1.0, uy=0.0, uz=0.0, ratio=0.08, a_ratio=0.01,
                        k_ratio=0.4, distribution="classic")
 
@@ -354,6 +354,35 @@ def enforce_shedding(chord_mode, shedding):
     return shedding
 
 
+def linear_twist_weights(n_pre, b, sym, space, root_ang, tip_ang, radius, center, delta):
+    """Spanwise weights of a scalar twist, mirroring VLMSurface.
+
+    Replicates the pre-twist grid of VLMSurface._build_wing (station spacing,
+    foil shape, dihedral rotation, symmetry merge) and the linear law of
+    VLMSurface._apply_twist (phi_j = |z| / z_tip): returns w_j, the weight of
+    each of the n_pre+1 stations (2*n_pre+1 merged stations if sym, like the
+    library's doubled N). _generate_foil/_unit_rot are reused unbound (they
+    don't use self); only the station spacing lines are mirrored.
+    """
+    le = 0.5 * b if sym else b
+    if space:
+        if sym:
+            theta = np.linspace(np.pi / 2, np.pi, n_pre + 1)
+            s = le * (-np.cos(theta))
+        else:
+            theta = np.linspace(0, np.pi, n_pre + 1)
+            s = le * (1 - np.cos(theta)) / 2
+    else:
+        s = np.linspace(0.0, le, n_pre + 1)
+    y, z = VLMSurface._generate_foil(None, s, root_ang, tip_ang, radius, center)
+    pts = VLMSurface._unit_rot(None, np.column_stack(
+        [np.zeros_like(y), y, z]), -delta, 0)
+    zz = pts[:, 2]
+    if sym:
+        zz = np.concatenate([-zz[::-1][:-1], zz])  # mirror merge (z flips about z=0)
+    return np.abs(zz) / zz[-1]
+
+
 def safe_name(s):
     """Filename-safe preset name (keeps spaces)."""
     return "".join(c if c not in '/\\:*?"<>|' else "_" for c in str(s)).strip() or "surface"
@@ -392,6 +421,9 @@ STUDY_FIELDS = {
     "surface: sweep [deg]": ("surface", "sweep", "float", "sweep", "deg"),
     "surface: dihedral [deg]": ("surface", "dihedral", "float", "dihedral", "deg"),
     "surface: twist [deg]": ("surface", "twist", "float", "twist", "deg"),
+    "surface: rake [deg]": ("surface", "rake", "float", "rake", "deg"),
+    "surface: chord [m]": ("surface", "chord", "str", "c", "m"),
+    "surface: chord line": ("surface", "c_line", "float", "c_line", "-"),
     "surface: root angle [deg]": ("surface", "root_ang", "float", "root", "deg"),
     "surface: tip angle [deg]": ("surface", "tip_ang", "float", "tip", "deg"),
     "surface: radius [m]": ("surface", "radius", "float", "radius", "m"),
@@ -537,20 +569,42 @@ def parse_surface_state(E, V):
         root_ang=eval_expr(E["root_ang"]), tip_ang=eval_expr(E["tip_ang"]),
         radius=eval_expr(E["radius"]), center=eval_expr(E["center"]),
         fly_height=eval_expr(E["fly_h"]),
+        c_line=eval_expr(str(E.get("c_line", "0.5") or "0.5")),
     )
     tw = str(E["twist"]).strip()
+    rake = eval_expr(str(E.get("rake", "0") or "0").strip() or "0") * DEG
     if "," in tw or " " in tw.strip():
         arr = np.array([eval_expr(x) for x in tw.replace(",", " ").split()]) * DEG
         if len(arr) != n_pre + 1:
             raise ValueError(f"twist list: {len(arr)} values, need n+1={n_pre + 1}")
-        p["phi"] = arr
-    else:
+        if p["sym"]:
+            # the library doubles N on merge and indexes one twist value per
+            # merged station: mirror the half-wing list (a plain n+1 list
+            # raises IndexError in _apply_twist)
+            arr = np.concatenate([arr[::-1][:-1], arr])
+        p["phi"] = arr + rake
+    elif rake == 0.0:
         p["phi"] = eval_expr(tw) * DEG
+    else:
+        # scalar twist is a linear root->tip ramp in the library: discretize it
+        # the same way, then shift every station by the uniform rake
+        w = linear_twist_weights(n_pre, p["b"], p["sym"], p["space"],
+                                 p["root_ang"], p["tip_ang"], p["radius"],
+                                 p["center"], p["delta"])
+        p["phi"] = w * (eval_expr(tw) * DEG) + rake
     mode = V["chord_mode"]
     if mode == "uniform":
         p["c"] = build_chord_array("uniform", "rectangular", 1.0, p["b"], n_pre,
                                    p["sym"], p["space"], 1.8,
                                    eval_or(E["c0"], D["c0"]))
+    elif mode == "custom":
+        raw = str(E.get("chord", "") or "")
+        vals = [eval_expr(x) for x in raw.replace(",", " ").split()]
+        if len(vals) != n_pre + 1:
+            raise ValueError(f"custom chord: {len(vals)} values, need n+1={n_pre + 1}")
+        if any(v <= 0 for v in vals):
+            raise ValueError("custom chord: all values must be > 0")
+        p["c"] = np.array(vals)
     else:
         p["c"] = build_chord_array("law", mode, eval_or(E["AR"], D["AR"]), p["b"],
                                    n_pre, p["sym"], p["space"],
@@ -569,7 +623,8 @@ def make_surface(p):
                       beta=p["beta"], lamb=p["lamb"], delta=p["delta"], phi=p["phi"],
                       sym=p["sym"], space=p["space"], n=p["n"], m=p["m"], vent=p["vent"],
                       root_ang=p["root_ang"], tip_ang=p["tip_ang"], radius=p["radius"],
-                      center=p["center"], fly_height=p["fly_height"])
+                      center=p["center"], fly_height=p["fly_height"],
+                      c_line=p.get("c_line", 0.5))
 
 
 def build_study_surface(state, overrides):
@@ -626,7 +681,8 @@ def forced_speed_mode(targets):
 
 
 LATEX = {"alpha": r"$\alpha$", "beta": r"$\beta$", "sweep": r"$\lambda$",
-         "dihedral": r"$\delta$", "twist": r"$\phi$", "span": r"$b$",
+         "dihedral": r"$\delta$", "twist": r"$\phi$", "rake": r"$rake$",
+         "c": r"$c$", "c_line": r"$c_{line}$", "span": r"$b$",
          "c0": r"$c_0$", "AR": r"$A_R$", "CL": r"$C_L$",
          "t": r"$t$", "dt": r"$dt$", "fly_h": r"$h$",
          "Fn_h": r"$F_{n_h}$", "Ux": r"$U_x$", "Uy": r"$U_y$", "Uz": r"$U_z$",
@@ -1033,6 +1089,7 @@ class SurfaceTab(ttk.Frame):
         self.built = None  # VLMSurface after Build
         self.vars = {}
         self._build_form()
+        self._build_chord_window()
         self._build_preview()
 
     # -- form --
@@ -1073,17 +1130,14 @@ class SurfaceTab(ttk.Frame):
         V["shedding"] = tk.StringVar(value=D["shedding"]); ttk.Combobox(form, textvariable=V["shedding"], values=["both", "left", "right", "none"], width=10, state="readonly").grid(row=r, column=1, padx=4, pady=1); r += 1
 
         E["span"] = self._field(form, r, "span b [m]", D["span"]); r += 1
-        ttk.Label(form, text="chord law").grid(row=r, column=0, sticky="w", padx=4, pady=1)
-        V["chord_mode"] = tk.StringVar(value=D["chord_mode"]); ttk.Combobox(form, textvariable=V["chord_mode"], values=["uniform", "rectangular", "elliptical", "tapered"], width=10, state="readonly").grid(row=r, column=1, padx=4, pady=1); r += 1
-        E["c0"] = self._field(form, r, "uniform c0 [m]", D["c0"]); r += 1
-        E["AR"] = self._field(form, r, "AR (law)", D["AR"]); r += 1
-        E["lam"] = self._field(form, r, "taper ratio (law)", D["lam"]); r += 1
+        ttk.Button(form, text="Chord parameters", command=self.open_chord).grid(row=r, column=0, columnspan=2, pady=4); r += 1
 
         E["alpha"] = self._field(form, r, "alpha [deg]", D["alpha"]); r += 1
         E["beta"] = self._field(form, r, "beta [deg]", D["beta"]); r += 1
         E["sweep"] = self._field(form, r, "sweep [deg]", D["sweep"]); r += 1
         E["dihedral"] = self._field(form, r, "dihedral [deg]", D["dihedral"]); r += 1
         E["twist"] = self._field(form, r, "twist [deg]", D["twist"]); r += 1
+        E["rake"] = self._field(form, r, "rake [deg] (uniform twist offset)", D["rake"]); r += 1
         E["n"] = self._field(form, r, "n spanwise (pre-symmetry)", D["n"]); r += 1
         E["m"] = self._field(form, r, "m chordwise", D["m"]); r += 1
         for key, label in [("sym", "symmetric (mirror + merge)"), ("space", "cosine spacing"), ("vent", "ventilated")]:
@@ -1097,7 +1151,6 @@ class SurfaceTab(ttk.Frame):
         V["show_mirror"] = tk.BooleanVar(value=False)
         ttk.Checkbutton(form, text="show mirror (boundary)", variable=V["show_mirror"],
                         command=self._redraw_preview).grid(row=r, column=0, columnspan=2, sticky="w", padx=4, pady=1); r += 1
-        V["chord_mode"].trace_add("write", lambda *a: self._on_chord_mode_change())
 
         ttk.Button(form, text="Build (init + plot)", command=self.on_build).grid(row=r, column=0, columnspan=2, pady=8)
         r += 1
@@ -1105,6 +1158,32 @@ class SurfaceTab(ttk.Frame):
         self.status.grid(row=r, column=0, columnspan=2, padx=4, pady=4)
         self.app._bind_wheel(canvas, canvas)
         self._hook_form_wheel(form, canvas)
+
+    def _build_chord_window(self):
+        """Hidden chord-parameters window (same pattern as the Study/Trim
+        'Solver parameters' windows). Widgets write into self.entries /
+        self.vars, so form_state / set_form_state / parse are unchanged."""
+        self.ch_win = tk.Toplevel(self)
+        self.ch_win.title("Chord parameters")
+        self.ch_win.protocol("WM_DELETE_WINDOW", self.ch_win.withdraw)
+        win = ttk.Frame(self.ch_win, padding=10)
+        win.pack(fill="both", expand=True)
+        win.columnconfigure(1, weight=1)
+        E, V, D = self.entries, self.vars, SURFACE_DEFAULTS
+        r = 0
+        ttk.Label(win, text="chord law").grid(row=r, column=0, sticky="w", padx=4, pady=1)
+        V["chord_mode"] = tk.StringVar(value=D["chord_mode"]); ttk.Combobox(win, textvariable=V["chord_mode"], values=["uniform", "rectangular", "elliptical", "tapered", "custom"], width=10, state="readonly").grid(row=r, column=1, padx=4, pady=1); r += 1
+        E["c0"] = self._field(win, r, "uniform c0 [m]", D["c0"]); r += 1
+        E["AR"] = self._field(win, r, "AR (law)", D["AR"]); r += 1
+        E["lam"] = self._field(win, r, "taper ratio (law)", D["lam"]); r += 1
+        E["chord"] = self._field(win, r, "custom chord [m] (n+1 values)", D["chord"]); r += 1
+        E["c_line"] = self._field(win, r, "chord line [0 LE - 1 TE]", D["c_line"]); r += 1
+        V["chord_mode"].trace_add("write", lambda *a: self._on_chord_mode_change())
+        self.ch_win.withdraw()
+
+    def open_chord(self):
+        self.ch_win.deiconify()
+        self.ch_win.lift()
 
     def _hook_form_wheel(self, root, canvas):
         self.app._bind_wheel(root, canvas)
@@ -2846,7 +2925,7 @@ class TrimTab(ttk.Frame):
 class VLMGui(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("VLM unsteady + ventilation")
+        self.title("VLM + ventilation")
         self.geometry("1280x780")
         self.solver = None
         self.msg_q = queue.Queue()
@@ -2910,7 +2989,7 @@ class VLMGui(tk.Tk):
         return [(tab.name, tab.built) for tab in self.surf_tabs if tab.built is not None]
 
     def _surf_dir(self):
-        d = os.path.join(ROOT, "opencode", "saved_surfaces")
+        d = os.path.join(ROOT, "data")
         os.makedirs(d, exist_ok=True)
         return d
 

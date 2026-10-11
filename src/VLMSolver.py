@@ -360,49 +360,6 @@ class VLMSolver:
             surface.CL     = 2*np.linalg.norm(F_tot[1:])/(np.sum(S)*u_norm*u_norm)
             surface.CD     = 2*np.linalg.norm(F_tot[0])/(np.sum(S)*u_norm*u_norm)
             
-        
-    def _secondary_computation (self):
-        """ 
-        Compute the loads using the pressure difference between the two sides of each panel, and summing up all the contributions
-        not updated
-
-        """
-        u_inf = self.U
-        for surface in self.surfaces :
-            m, n    = surface.M, surface.N
-            u_inf   = self.U
-            gamma   = surface.gamma
-            gamma_w = surface.gamma_wake
-            panels  = surface.wing_panels["real"]
-            ctrl    = np.array([p.ctr for p in panels])
-            normals = np.array([p.normal for p in panels])
-            u_inf   = np.tile(u_inf, (n*m, 1))
-            dp      = []
-            d_gam_i = np.concatenate([gamma[n:],gamma_w["middle"][:n]]) - np.concatenate([np.zeros_like(gamma[:n]), gamma[:n*(m-1)]])     # delta circulation at each control point in the chordwise direction   
-            # delta circulation at each control point in the spanwise direction
-            if surface.tip_shed == "both":  
-                n_w = round(len(gamma_w["left"])/m)                            # number of panels in chordwise direction for the tip wake                
-                d_gam_j = np.hstack([gamma.reshape(m, n)[:,1:],gamma_w["right"].reshape(m,n_w)[:,0][:,None]]).reshape(-1) - np.hstack([gamma_w["left"].reshape(m,n_w)[:,-1][:,None], gamma.reshape(m, n)[:,:-1]]).reshape(-1)  
-            elif surface.tip_shed == "right":
-                n_w = round(len(gamma_w["right"])/m)                           # number of panels in chordwise direction for the tip wake
-                d_gam_j = np.hstack([gamma.reshape(m, n)[:,1:],gamma_w["right"].reshape(m,n_w)[:,0][:,None]]).reshape(-1) - np.hstack([gamma.reshape(m, n)[:,0][:,None], gamma.reshape(m, n)[:,:-1]]).reshape(-1)
-            elif surface.tip_shed == "left": 
-                n_w = round(len(gamma_w["left"])/m )                           # number of panels in chordwise direction for the tip wake
-                d_gam_j = np.hstack([gamma.reshape(m, n)[:,1:],gamma.reshape(m, n)[:,-1][:,None]]).reshape(-1) - np.hstack([gamma_w["left"].reshape(m,n_w)[:,-1][:,None], gamma.reshape(m, n)[:,:-1]]).reshape(-1)
-            else :
-                d_gam_j = np.hstack([gamma.reshape(m, n)[:,1:],gamma.reshape(m, n)[:,-1][:,None]]).reshape(-1) - np.hstack([gamma.reshape(m, n)[:,0][:,None], gamma.reshape(m, n)[:,:-1]]).reshape(-1)
-            
-            taux_i  = np.array([p.chord/(np.linalg.norm(p.chord)**2) for p in panels])          # chordwise unit vector divided by the mean chord length, for each panel
-            taux_j  = np.array([p.width/(np.linalg.norm(p.width)**2) for p in panels])          # spanwise unit vector divided by the mean width, for each panel
-            S       = np.array([p.area for p in panels])                                        # area of each panel
-            c1, c2, gamma_v = self._full_vectorize(False)
-            V       = u_inf #+ self._induced_velocity(ctrl, c1, c2, gamma_v)
-            dp      = np.sum(V * (taux_i*d_gam_i[:,None]/2 + taux_j*d_gam_j[:,None]/2), axis=1) 
-            dF      = -dp[:,None]*S[:,None]*normals                                  
-            F_tot   = np.sum(dF, axis = 0)
-            S = np.sum(np.array([p.area for p in surface.wing_panels["real"]]).reshape(m,n), axis=0)
-            surface.Cl_2d = 2*np.sum(dF[:,1].reshape(m, n), axis=0)/S
-            surface.loads = F_tot
 
     def _time_sim(self, t=None, dt=None, distribution="classic", computations=[]):
         """ 

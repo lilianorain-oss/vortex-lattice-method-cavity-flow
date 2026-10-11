@@ -1,5 +1,4 @@
 import copy
-import sys
 import numpy             as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
@@ -44,6 +43,33 @@ def chord_fn(n, ar, b, sym, space, shape, lam=1.8):
         case "tapered":
             c = - s*4*(lam - 1)/(ar*(lam + 1)) + 4*le*lam/(ar*(lam + 1))
     return c
+
+def chord_a_class (n=20, space=False):
+    """
+    Chord length distribution for A Class foils
+    
+    Input :
+        n     -> number of spanwise stations
+        space -> uniform or cosine spanwise spacing
+    
+    Output :
+        c     -> chord length distribution along spanwise direction, shape (n,)
+    """
+    if space :
+        theta = np.linspace(0, np.pi, n+1)
+        s =1.13*(1-np.cos(theta))/2
+    else :
+        s = np.linspace(0, 1.13, n+1)
+    count = 0
+    for z in s:
+        if z < 0.83:
+            count += 1
+    c_uniform = 0.16*np.ones(count)
+    s = s[count:] - 0.83
+    a = np.sqrt(1-(0.06/0.16)**2)
+    c_elli = 0.16 * np.sqrt(1 - (a*s/0.3)**2)
+    c_tot = np.concatenate((c_uniform, c_elli))
+    return c_tot
 
 def plot3D(surfaces, show_mirror=False, show_norm=False):
     """ 
@@ -296,47 +322,13 @@ def load_csv(filepath):
         return None, None
 
 
-def plot_ventilation(surface, harwood):
+def plot_ventilation(surface):
     """ 
     Plot the distributions of the ventilation parameters along the spanwise direction 
     
     """
     fig = plt.figure(figsize=(7/1, 4/1),constrained_layout=True)
     ax  = fig.add_subplot()
-
-    if harwood == True :
-        x, y = load_csv("data/cavity.csv")
-        sorted_ind = np.argsort(x)
-        x, y_bottom = x[sorted_ind], y[sorted_ind]
-        y_top = np.zeros_like(y_bottom)
-        ax.fill_between(x, y_top, y_bottom, 
-                    facecolor='#90EE90',  # Vert clair (LightGreen)
-                    alpha=0.6, 
-                    edgecolor='none')
-        ax.plot(x, y_bottom, lw=0.8, color='black', label=r"$L_c/c$ experimental")
-
-        x, y = load_csv("data/Lc.csv")
-        sorted_ind = np.argsort(x)
-        x, y = x[sorted_ind], y[sorted_ind]
-        ax.plot(x, y, "--", color="gray", label=r'$L_c/c$'+"  LLM")
-        x, y = load_csv("data/cl.csv")
-        sorted_ind = np.argsort(y)
-        x, y = x[sorted_ind], y[sorted_ind]
-        ax.plot(x, y, "--", color="black", label=r'$C_{l_\text{2D}}$'+"  LLM")
-        x, y = load_csv("data/alpha.csv")
-        sorted_ind = np.argsort(y)
-        x, y = x[sorted_ind], y[sorted_ind]
-        ax.plot(x, y, "--", color="red", label=r'$\alpha_{\text{eff}}/\alpha$'+"  LLM")
-        x, y = load_csv("data/a0.csv")
-        sorted_ind = np.argsort(y)
-        x, y = x[sorted_ind], y[sorted_ind]
-        ax.plot(x, y, "--", color="magenta", label=r'$a_0/(2\pi)$'+"  LLM")
-        x, y = load_csv("data/sigma.csv")
-        sorted_ind = np.argsort(y)
-        x, y = x[sorted_ind], y[sorted_ind]
-        ax.plot(x, y, "--", color="blue", label=r'$\sigma_c$')
-
-
     M, N, B = surface.M, surface.N, surface.span
     ctrl    = np.array([p.ctr for p in surface.wing_panels["real"]])
     z       = np.sum(ctrl.reshape((M,N,3)), axis=0)[:,2]/M
@@ -349,8 +341,7 @@ def plot_ventilation(surface, harwood):
     ax.plot(vent["a0"]/(2*np.pi), z, color="magenta", label=r'$a_0/(2\pi)$'+"  VLM")
     ax.plot(vent["sigma_c"], z, color="blue", label=r'$\sigma_c$'+"  VLM")
     ax.plot()
-    ax.set_xlim(-0.2, 1.9)
-    ax.set_ylim(1.2,-0.3)
+    ax.invert_yaxis()
     ax.xaxis.set_major_locator(MultipleLocator(0.2))
     ax.yaxis.set_major_locator(MultipleLocator(0.2))
     ax.set_xlabel(r'$x/c$')
